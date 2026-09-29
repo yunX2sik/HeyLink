@@ -1,14 +1,14 @@
 # =====================================================================
 #  HayLink Lite v0.3 - 몽골 조드(Dzud) 대비 공동 건초창고 재고 자동기록 · 구호사료 공동배송 프로토타입
 #  모바일 UI + 3개 언어 (ko / en / mn)
-#  실행: python app.py  →  브라우저 http://127.0.0.1:5000   (폰: http://노트북IP:5000)
+#  실행: python Mongolian_app.py  →  브라우저 http://127.0.0.1:5000   (폰: http://노트북IP:5000)
 #  필요: pip install flask
 #  선택: 환경변수 HAYLINK_ADMIN_PIN=1234  → 관리자 화면·데모 초기화·대리 신청에 PIN 요구 (미설정 시 열림)
 #
 #  v0.3 변경점
-#   - [핵심] 창고 재고보다 많은 사료 신청·배송을 차단 (신청 가능량 = 재고 − 대기 신청량)
-#   - 재고 < 트럭 1대 분량이면 공동배송 불가 표시, 배송 시점 재고 재검증
-#   - 입고(재고 급증) 감지 후 그 이후 데이터만 소진 예측에 사용
+#   - [핵심] 재고 < 트럭 1대(5t) 창고는 신청·배송 모두 차단 (재보충 전까지)
+#   - [핵심] 재고 ≥ 5t 창고도 신청 가능량 = 재고 − 대기 신청량 범위 안에서만 접수
+#   - 배송 시점 재고 재검증, 입고(재고 급증) 감지 후 그 이후 데이터만 예측에 사용
 #   - 잔량 0% 예측 버그, 시연 반출 ×3 버그, 템플릿 자동 이스케이프(XSS) 수정
 #   - 기온 캐시 TTL, 입력 검증, 관리자 PIN, 데모 시드 고정
 # =====================================================================
@@ -95,7 +95,8 @@ T = {
  "stock_in_wh":  {"ko": "창고 재고", "en": "Warehouse stock", "mn": "Агуулахын нөөц"},
  "avail":        {"ko": "신청 가능", "en": "Available", "mn": "Хүсэх боломжтой"},
  "stock_short":  {"ko": "⛔ 창고 재고 부족 — 재보충 후 신청 가능", "en": "⛔ Warehouse stock too low — request after restock", "mn": "⛔ Агуулахын нөөц хүрэлцэхгүй — нөхсөний дараа хүсэлт гаргана уу"},
- "no_truck_stock":{"ko": "⛔ 재고 {s}t < 트럭 {n}t — 창고 재보충 전까지 공동배송 불가", "en": "⛔ Stock {s} t < truck {n} t — no shared delivery until restock", "mn": "⛔ Нөөц {s} тн < машин {n} тн — нөөц нөхөх хүртэл хамтарсан хүргэлт боломжгүй"},
+ "no_truck_stock":{"ko": "⛔ 재고 {s}t < 트럭 {n}t — 창고 재보충 전까지 신청·공동배송 불가", "en": "⛔ Stock {s} t < truck {n} t — no requests or shared delivery until restock", "mn": "⛔ Нөөц {s} тн < машин {n} тн — нөөц нөхөх хүртэл хүсэлт, хамтарсан хүргэлт боломжгүй"},
+ "req_closed":   {"ko": "⛔ 신청 불가 (재고 부족)", "en": "⛔ Requests closed (low stock)", "mn": "⛔ Хүсэлт хаалттай (нөөц бага)"},
  "dispatch_btn": {"ko": "🚚 트럭 1대 분량 도달 — 배송 요청", "en": "🚚 Truck full — request delivery", "mn": "🚚 Машин дүүрсэн — хүргэлт хүсэх"},
  "more_needed":  {"ko": "{n}t 더 모이면 배송 가능", "en": "{n} t more to dispatch", "mn": "Дахин {n} тн цуглавал хүргэх боломжтой"},
  "via_app":      {"ko": "📱 ① 앱으로 신청", "en": "📱 ① Request via app", "mn": "📱 ① Аппаар хүсэлт гаргах"},
@@ -160,7 +161,6 @@ T = {
  # 메시지
  "msg_order_ok": {"ko": "✅ 신청 등록 완료: {name} {tons}t → {wh} (신청 가능 잔여 {avail}t)", "en": "✅ Request registered: {name} {tons} t → {wh} ({avail} t still available)", "mn": "✅ Хүсэлт бүртгэгдсэн: {name} {tons} тн → {wh} (хүсэх боломжтой {avail} тн үлдсэн)"},
  "msg_wh_short": {"ko": "❌ {wh} 신청 불가: 재고 {stock}t < 트럭 {n}t — 창고 재보충 전까지 신청을 받지 않습니다", "en": "❌ {wh}: requests closed — stock {stock} t < truck {n} t, reopens after restock", "mn": "❌ {wh}: хүсэлт хаалттай — нөөц {stock} тн < машин {n} тн, нөөц нөхсөний дараа дахин нээгдэнэ"},
- "req_closed":   {"ko": "⛔ 신청 불가 (재고 부족)", "en": "⛔ Requests closed (low stock)", "mn": "⛔ Хүсэлт хаалттай (нөөц бага)"},
  "msg_over_stock":{"ko": "❌ {wh} 신청 불가: 요청 {tons}t > 신청 가능 {avail}t (창고 재고 {stock}t, 대기 {pend}t)", "en": "❌ {wh}: cannot request {tons} t — only {avail} t available (stock {stock} t, pending {pend} t)", "mn": "❌ {wh}: {tons} тн хүсэх боломжгүй — {avail} тн л боломжтой (нөөц {stock} тн, хүлээгдэж буй {pend} тн)"},
  "msg_bad_input":{"ko": "❌ 입력 오류: 이름과 {m}t 이상의 톤수를 입력하세요", "en": "❌ Invalid input: enter a name and at least {m} t", "mn": "❌ Оролт буруу: нэр болон {m} тн-оос дээш тонн оруулна уу"},
  "msg_not_enough":{"ko": "❌ 아직 트럭 {n}t 미달", "en": "❌ Still below truck load {n} t", "mn": "❌ {n} тн-д хүрээгүй байна"},
@@ -365,10 +365,10 @@ def pending_tons(wid):
 
 def availability(w, p=None):
     """[핵심] 창고 재고 대비 신청/배송 가능 여부
-       avail         = 재고(t) − 대기 신청(t)   → 이 범위 안에서만 새 신청 허용
-       truck_possible= 재고 ≥ 트럭 1대          → 아니면 공동배송 자체가 불가
-       can_dispatch  = 대기 ≥ 트럭 1대 AND 대기 ≤ 재고"""
-       p = p or predict(w)
+       truck_possible = 재고 ≥ 트럭 1대          → 아니면 신청·배송 모두 불가
+       avail          = 재고(t) − 대기 신청(t)   → 이 범위 안에서만 새 신청 허용
+       can_dispatch   = 대기 ≥ 트럭 1대 AND 대기 ≤ 재고"""
+    p = p or predict(w)
     pend, n = pending_tons(w["id"])
     stock = p["cur_ton"]
     truck_possible = stock >= TRUCK_CAPACITY_T
@@ -377,7 +377,6 @@ def availability(w, p=None):
     return {"stock": stock, "pend": round(pend, 1), "n": n, "avail": round(avail, 1),
             "truck_possible": truck_possible,
             "can_dispatch": truck_possible and pend >= TRUCK_CAPACITY_T and pend <= stock + 1e-9}
-
 
 def try_add_order(wid, herder, phone, tons, channel):
     """검증 후 신청 등록. (ok, msg_key, kwargs) 반환. 앱·SMS·대리 3채널이 모두 이 함수를 거침."""
@@ -388,11 +387,10 @@ def try_add_order(wid, herder, phone, tons, channel):
     except (TypeError, ValueError): tons = 0.0
     if not w or not herder or tons < ORDER_MIN_T:
         return False, "msg_bad_input", {"m": ORDER_MIN_T}
-        a = availability(w)
+    a = availability(w)
     if not a["truck_possible"]:
-        return False, "msg_wh_short", {"wh": wh_name(wid), "stock": a["stock"], "n": TRUCK_CAPACITY_T}
+        return False, "msg_wh_short", {"wh": wh_name(wid), "stock": a["stock"], "n": TRUCK_CAPACITY_T, "avail": 0.0}
     if tons > a["avail"] + 1e-9:
-
         return False, "msg_over_stock", {"wh": wh_name(wid), "tons": tons, "avail": a["avail"], "stock": a["stock"], "pend": a["pend"]}
     x("INSERT INTO orders VALUES(NULL,?,?,?,?,?,?,?)", (wid, herder, phone, tons, channel, "pending", now_iso()))
     return True, "msg_order_ok", {"name": herder, "tons": tons, "wh": wh_name(wid), "avail": round(a["avail"] - tons, 1)}
@@ -490,7 +488,7 @@ INDEX = """{% extends "base.html" %}{% block content %}
  <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:4px">
   <span><b style="font-size:1.4rem">{{ p.cur_pct }}%</b> <span class="muted">≈ {{ p.cur_ton }}t {{ t('left') }}</span></span>
   <span class="muted">{{ t('runs_out') }} <b>{{ p.deplete_date }}</b></span></div>
- <div class="muted">{{ t('per_day') }} {{ p.per_day }}% · {{ t('avail') }} <b>{{ a.avail }}t</b>{% if not p.sensor_ok %} · <span style="color:#e53935">⚠ {{ t('sensor_off') }}</span>{% endif %}</div>
+ <div class="muted">{{ t('per_day') }} {{ p.per_day }}% · {% if a.truck_possible %}{{ t('avail') }} <b>{{ a.avail }}t</b>{% else %}<span style="color:#e53935">{{ t('req_closed') }}</span>{% endif %}{% if not p.sensor_ok %} · <span style="color:#e53935">⚠ {{ t('sensor_off') }}</span>{% endif %}</div>
 </div></a>
 {% endfor %}
 <div class="card"><h2>ℹ️ {{ t('about_title') }}</h2><p class="muted" style="margin:0">{{ t('about_body') }}</p></div>
@@ -528,8 +526,6 @@ DETAIL = """{% extends "base.html" %}{% block content %}
 WH_SELECT = """<select name="warehouse_id">{% for w in warehouses %}{% set a = av[w.id] %}
 <option value="{{ w.id }}" data-avail="{{ a.avail }}" data-hint="{% if not a.truck_possible %}{{ t('no_truck_stock', s=a.stock, n=truck) }}{% else %}{{ t('avail') }} {{ a.avail }}t · {{ t('stock_in_wh') }} {{ a.stock }}t · {{ t('pending') }} {{ a.pend }}t{% endif %}" {% if w.id==sel %}selected{% endif %}>{{ w.name[lang] }} — {% if not a.truck_possible %}{{ t('req_closed') }}{% else %}{{ t('avail') }} {{ a.avail }}t{% endif %}</option>{% endfor %}</select>
 <div class="muted avail-hint" style="margin:0 0 4px 4px"></div>"""
-
-
 
 ORDER = """{% extends "base.html" %}{% block content %}
 <h1>{{ t('order_title') }}<span class="sub">{{ t('order_sub', n=truck) }}</span></h1>
@@ -652,7 +648,9 @@ def dispatch(wid):
     w = WH_BY_ID.get(wid)
     if not w: return "not found", 404
     p = predict(w); a = availability(w, p)
-    # [핵심] 트럭 1대 미달 → 불가 / 대기량이 현재 재고보다 많으면(센서로 소비 확인) → 불가
+    # [핵심] 재고 < 트럭 1대 → 불가 / 대기 < 트럭 1대 → 불가 / 대기 > 재고(센서로 소비 확인) → 불가
+    if not a["truck_possible"]:
+        return redirect(msg_url("/order", "msg_wh_short", kind="err", wh=wh_name(wid), stock=a["stock"], n=TRUCK_CAPACITY_T))
     if a["pend"] < TRUCK_CAPACITY_T:
         return redirect(msg_url("/order", "msg_not_enough", kind="err", n=TRUCK_CAPACITY_T))
     if not a["can_dispatch"]:
@@ -711,9 +709,8 @@ def api_sms():
         pend, _ = pending_tons(parsed["warehouse_id"])
         reply = t("sms_reply_ok", name=kw["name"], tons=kw["tons"], wh=kw["wh"], pend=round(pend, 1), truck=TRUCK_CAPACITY_T)
         return redirect(msg_url("/order", "msg_sms_ok", reply=reply))
-       if key in ("msg_over_stock", "msg_wh_short"):
-
-        reply = t("sms_reply_no", wh=kw["wh"], avail=kw["avail"])
+    if key in ("msg_over_stock", "msg_wh_short"):
+        reply = t("sms_reply_no", wh=kw["wh"], avail=kw.get("avail", 0.0))
         return redirect(msg_url("/order", "msg_sms_ok", kind="err", reply=reply))
     return redirect(msg_url("/order", "msg_sms_err", kind="err", e=t(key, **kw)))
 
