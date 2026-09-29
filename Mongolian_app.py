@@ -553,7 +553,8 @@ def demo_reset():
     init_db()
     return redirect(msg_url("/admin", "msg_reset"))
 
+init_db()
+
 if __name__ == "__main__":
-    init_db()
-    print("HayLink Lite v0.2 → http://127.0.0.1:5000   (폰: http://노트북IP:5000)")
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    print("HayLink Lite v0.2 → http://127.0.0.1:5000")
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
