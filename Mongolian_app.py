@@ -1,4 +1,4 @@
-# =====================================================================
+﻿# =====================================================================
 #  HayLink Lite v0.3 - 몽골 조드(Dzud) 대비 공동 건초창고 재고 자동기록 · 구호사료 공동배송 프로토타입
 #  모바일 UI + 3개 언어 (ko / en / mn)
 #  실행: python Mongolian_app.py  →  브라우저 http://127.0.0.1:5000   (폰: http://노트북IP:5000)
@@ -48,9 +48,26 @@ WAREHOUSES = [
 ]
 WH_BY_ID = {w["id"]: w for w in WAREHOUSES}
 
+# ─────────────── 챗봇 자주 묻는 질문 ───────────────
+# 새 질문을 추가하려면 아래 목록에 {"keywords": [...], "answer": {...}} 한 덩어리를 더하면 됩니다.
+FAQS = [
+    {"keywords": ["배송", "도착", "택배", "delivery", "shipping", "arrive", "хүргэлт", "ирэх"],
+     "answer": {"ko": "현재 배송이 진행 중이며 날씨로 인해 정확한 도착 날짜 측정이 어렵습니다.",
+                "en": "Your delivery is in progress, but bad weather makes it hard to give an exact arrival date.",
+                "mn": "Хүргэлт явагдаж байна, гэвч цаг агаарын улмаас яг хэзээ ирэхийг тодорхойлоход хэцүү байна."}},
+]
+
 # ═══════════════════ 번역 사전 ═══════════════════
 T = {
  "tagline":      {"ko": "건초 재고 · 공동배송", "en": "Hay stock · shared delivery", "mn": "Өвсний нөөц · хамтарсан хүргэлт"},
+ # 챗봇
+ "nav_chat":     {"ko": "챗봇", "en": "Chatbot", "mn": "Чатбот"},
+ "chat_title":   {"ko": "무엇이든 물어보세요", "en": "Ask us anything", "mn": "Юу ч асууж болно"},
+ "chat_sub":     {"ko": "자주 묻는 질문에 바로 답해 드려요", "en": "Instant answers to common questions", "mn": "Түгээмэл асуултад шууд хариулна"},
+ "chat_hello":   {"ko": "안녕하세요! 궁금한 점을 입력해 주세요. 예) 배송이 언제 오나요?", "en": "Hello! Type your question. e.g. When will my delivery arrive?", "mn": "Сайн байна уу! Асуултаа бичнэ үү. жишээ нь: Хүргэлт хэзээ ирэх вэ?"},
+ "chat_ph":      {"ko": "질문을 입력하세요", "en": "Type your question", "mn": "Асуултаа бичнэ үү"},
+ "chat_send":    {"ko": "보내기", "en": "Send", "mn": "Илгээх"},
+ "chat_fallback":{"ko": "죄송해요, 아직 이 질문은 답을 준비하지 못했어요. 관리자에게 문의해 주세요.", "en": "Sorry, I don't have an answer for that yet. Please contact the administrator.", "mn": "Уучлаарай, энэ асуултад хараахан хариулт бэлдээгүй байна. Удирдлагад хандана уу."},
  "nav_wh":       {"ko": "창고", "en": "Warehouses", "mn": "Агуулах"},
  "nav_order":    {"ko": "배송 신청", "en": "Requests", "mn": "Хүсэлт"},
  "nav_admin":    {"ko": "관리자", "en": "Admin", "mn": "Удирдлага"},
@@ -419,6 +436,14 @@ def parse_sms(text):
     except ValueError: return None, t("sms_num")
     return {"warehouse_id": w["id"], "tons": tons, "herder": " ".join(parts[3:]) or t("sms_herder")}, "OK"
 
+def answer_faq(text):
+    text = (text or "").lower()
+    best, best_score = None, 0
+    for faq in FAQS:
+        score = sum(1 for k in faq["keywords"] if k.lower() in text)
+        if score > best_score: best, best_score = faq, score
+    return best["answer"][g.lang] if best else t("chat_fallback")
+
 # ═══════════════════ 화면 (모바일 UI) ═══════════════════
 # 템플릿 이름에 .html 을 붙여야 Jinja 자동 이스케이프가 켜짐 (v0.2는 꺼져 있어 XSS 가능했음)
 BASE = """<!doctype html><html lang="{{ lang }}"><head><meta charset="utf-8">
@@ -459,6 +484,11 @@ button.secondary{background:#607d8b} button.danger{background:#e53935} button.ou
 .tabs a span{font-size:1.35rem} .tabs a.on{color:#2e5d34}
 code{background:#f0f2ee;padding:2px 6px;border-radius:6px;font-size:.85em;word-break:break-all}
 footer{text-align:center;color:#9aa49c;font-size:.75rem;padding:8px 0 4px}
+.chatlog{display:flex;flex-direction:column;gap:8px;min-height:260px}
+.bubble{max-width:85%;padding:10px 14px;border-radius:16px;font-size:.92rem;line-height:1.45;white-space:pre-wrap}
+.bubble.bot{background:#e8f5e9;align-self:flex-start;border-bottom-left-radius:4px}
+.bubble.me{background:#2e5d34;color:#fff;align-self:flex-end;border-bottom-right-radius:4px}
+.chatform{display:flex;gap:8px} .chatform input{flex:1;margin:0} .chatform button{width:auto;margin:0;padding:0 18px}
 </style></head><body><div class="phone">
 <header><a class="logo" href="/">🌾 HayLink Lite<small>{{ t('tagline') }}</small></a>
 <div class="lang">{% for c,l in [('ko','KO'),('en','EN'),('mn','MN')] %}<a href="/lang/{{ c }}" class="{{ 'on' if c==lang else '' }}">{{ l }}</a>{% endfor %}</div></header>
@@ -468,6 +498,7 @@ footer{text-align:center;color:#9aa49c;font-size:.75rem;padding:8px 0 4px}
 <nav class="tabs">
 <a href="/" class="{{ 'on' if request.path=='/' or request.path.startswith('/warehouse') else '' }}"><span>🏠</span>{{ t('nav_wh') }}</a>
 <a href="/order" class="{{ 'on' if request.path.startswith('/order') else '' }}"><span>🚚</span>{{ t('nav_order') }}</a>
+<a href="/chat" class="{{ 'on' if request.path.startswith('/chat') else '' }}"><span>💬</span>{{ t('nav_chat') }}</a>
 <a href="/admin" class="{{ 'on' if request.path.startswith('/admin') else '' }}"><span>📊</span>{{ t('nav_admin') }}</a>
 </nav></div>
 <script>
@@ -596,8 +627,29 @@ PIN = """{% extends "base.html" %}{% block content %}
  <button type="submit">{{ t('pin_btn') }}</button></form></div>
 {% endblock %}"""
 
+CHAT = """{% extends "base.html" %}{% block content %}
+<h1>{{ t('chat_title') }}<span class="sub">{{ t('chat_sub') }}</span></h1>
+<div class="card"><div class="chatlog" id="log"><div class="bubble bot">{{ t('chat_hello') }}</div></div></div>
+<form class="chatform" id="chatform">
+ <input id="q" placeholder="{{ t('chat_ph') }}" autocomplete="off" required>
+ <button type="submit">{{ t('chat_send') }}</button></form>
+<script>
+const log = document.getElementById('log'), form = document.getElementById('chatform'), q = document.getElementById('q');
+function add(cls, text){ const d = document.createElement('div'); d.className = 'bubble ' + cls; d.textContent = text; log.appendChild(d); d.scrollIntoView({block:'end'}); }
+form.addEventListener('submit', async function(e){
+  e.preventDefault();
+  const text = q.value.trim(); if(!text) return;
+  add('me', text); q.value = '';
+  try {
+    const res = await fetch('/api/chat', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text: text})});
+    const data = await res.json(); add('bot', data.answer);
+  } catch(err) { add('bot', '...'); }
+});
+</script>
+{% endblock %}"""
+
 app.jinja_loader = DictLoader({"base.html": BASE, "index.html": INDEX, "detail.html": DETAIL,
-                               "order.html": ORDER, "admin.html": ADMIN, "pin.html": PIN})
+                               "order.html": ORDER, "admin.html": ADMIN, "pin.html": PIN, "chat.html": CHAT})
 
 def avail_map():
     return {w["id"]: availability(w) for w in WAREHOUSES}
@@ -713,6 +765,15 @@ def api_sms():
         reply = t("sms_reply_no", wh=kw["wh"], avail=kw.get("avail", 0.0))
         return redirect(msg_url("/order", "msg_sms_ok", kind="err", reply=reply))
     return redirect(msg_url("/order", "msg_sms_err", kind="err", e=t(key, **kw)))
+
+@app.route("/chat")
+def chat():
+    return render_template("chat.html")
+
+@app.route("/api/chat", methods=["POST"])
+def api_chat():
+    data = request.get_json(silent=True) or request.form
+    return jsonify({"answer": answer_faq(data.get("text", ""))})
 
 @app.route("/api/warehouses")
 def api_warehouses():
