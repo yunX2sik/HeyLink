@@ -5,6 +5,7 @@
 #  필요: pip install flask
 #  선택: 환경변수 DATABASE_URL=postgresql://...  → PostgreSQL(Neon)에 저장 (없으면 SQLite 파일). 시연·운영 데이터는 DB 안 demo / live 스키마로 분리
 #  선택: 환경변수 HAYLINK_MODE=live → 운영 모드 (가짜 데이터·시연 버튼 없음, DB 파일도 haylink_live.db 로 분리). 기본은 demo
+#        단, DATABASE_URL + HAYLINK_ADMIN_PIN 이 모두 있으면 관리자 화면의 '운영 모드 전환' 버튼으로 바꾸고(DB에 저장), 이때 HAYLINK_MODE 는 저장된 값이 없을 때의 처음 값일 뿐
 #  선택: 환경변수 HAYLINK_ADMIN_PIN=1234 → 관리자 화면·데모 초기화·대리 신청에 PIN 요구 (미설정 시 열림)
 #
 #  v0.3 변경점
@@ -14,11 +15,11 @@
 #   - 잔량 0% 예측 버그, 시연 반출 ×3 버그, 템플릿 자동 이스케이프(XSS) 수정
 #   - 기온 캐시 TTL, 입력 검증, 관리자 PIN, 데모 시드 고정
 # =====================================================================
-from flask import Flask, request, jsonify, render_template, redirect, g, Response
+from flask import Flask, request, jsonify, render_template, redirect, g, Response, has_request_context
 from jinja2 import DictLoader
 from urllib.parse import quote, urlparse
 from functools import wraps
-import sqlite3, datetime, random, json, urllib.request, os, re, csv, io, time, atexit
+import sqlite3, datetime, random, json, urllib.request, os, re, csv, io, time, atexit, threading, hmac
 from contextlib import contextmanager
 
 # ─────────────── 설정 ───────────────
@@ -38,6 +39,8 @@ ORDER_MIN_T      = 0.5           # 1회 최소 신청량
 REFILL_JUMP_PCT  = 8.0           # 측정 간 재고가 이만큼 이상 늘면 '입고'로 간주
 TEMP_TTL_S       = 3600          # 기온 캐시 유효시간(초)
 ADMIN_PIN        = os.environ.get("HAYLINK_ADMIN_PIN", "")   # 빈 문자열이면 보호 없음
+MODE_SWITCHABLE  = USE_PG and bool(ADMIN_PIN) and not os.environ.get("HAYLINK_PG_SCHEMA")   # 관리자 화면에서 시연/운영 모드를 바꿀 수 있는 조건: Neon 사용 + PIN 설정 (이때 환경변수 HAYLINK_MODE 는 '처음 값'일 뿐)
+MODE_TTL_S       = 5             # 다른 서버(워커)가 모드 변경을 알아채는 데 걸리는 최대 시간(초)
 GEMINI_MODELS    = os.environ.get("HAYLINK_GEMINI_MODEL", "gemini-3.1-flash-lite,gemini-3.5-flash").split(",")   # 앞 모델이 오류·지연이면 다음 모델 시도 (무료 키로 사용 가능)
 GEMINI_TIMEOUT_S = 12            # 모델 하나당 최대 대기 시간(초). 서버가 30초를 넘기면 요청을 끊으므로 짧게 둠
 CHAT_MAX_TURNS   = 10            # AI에게 함께 보내는 이전 대화 최대 개수
@@ -89,9 +92,7 @@ T = {
  "nav_chat":     {"ko": "챗봇", "en": "Chatbot", "mn": "Чатбот"},
  "chat_title":   {"ko": "무엇이든 물어보세요", "en": "Ask us anything", "mn": "Юу ч асууж болно"},
  "chat_sub":     {"ko": "자주 묻는 질문에 바로 답해 드려요", "en": "Instant answers to common questions", "mn": "Түгээмэл асуултад шууд хариулна"},
- "chat_hello":   {"ko": "안녕하세요! 궁금한 점을 입력해 주세요. 예) 배송이 언제 오나요?\n'배송', '재고', '입고', '신청'만 입력하면 자주 묻는 질문을 골라 볼 수 있어요.",
-                  "en": "Hello! Type your question. e.g. When will my delivery arrive?\nType just 'delivery', 'stock', 'restock' or 'request' to pick from common questions.",
-                  "mn": "Сайн байна уу! Асуултаа бичнэ үү. жишээ нь: Хүргэлт хэзээ ирэх вэ?\n'хүргэлт', 'нөөц', 'нөхөх', 'хүсэлт' гэж бичвэл түгээмэл асуултуудаас сонгож болно."},
+ "chat_hello":   {"ko": "무엇을 도와드릴까요?", "en": "How can I help you?", "mn": "Танд юугаар туслах вэ?"},
  "chat_ph":      {"ko": "질문을 입력하세요", "en": "Type your question", "mn": "Асуултаа бичнэ үү"},
  "chat_send":    {"ko": "보내기", "en": "Send", "mn": "Илгээх"},
  "chat_pick":    {"ko": "많이 묻는 질문이에요. 궁금한 걸 골라 주세요 👇", "en": "These are frequently asked. Pick one 👇", "mn": "Түгээмэл асуултууд. Сонгоно уу 👇"},
@@ -213,6 +214,23 @@ T = {
  "pin_ph":       {"ko": "PIN", "en": "PIN", "mn": "PIN"},
  "pin_btn":      {"ko": "확인", "en": "Enter", "mn": "Нэвтрэх"},
  "pin_bad":      {"ko": "PIN이 올바르지 않습니다", "en": "Wrong PIN", "mn": "PIN буруу байна"},
+ # 운영 모드 전환 (관리자)
+ "mode_title":   {"ko": "운영 모드 전환", "en": "Switch operating mode", "mn": "Ажиллах горим солих"},
+ "mode_now":     {"ko": "지금 모드", "en": "Current mode", "mn": "Одоогийн горим"},
+ "mode_demo":    {"ko": "시연 (가짜 데이터)", "en": "Demo (sample data)", "mn": "Жишээ (хуурамч өгөгдөл)"},
+ "mode_live":    {"ko": "실제 운영 (실제 데이터)", "en": "Live (real data)", "mn": "Бодит ажиллагаа (бодит өгөгдөл)"},
+ "mode_warn":    {"ko": "바꾸면 모든 사용자의 화면이 바로 바뀝니다. 두 모드의 데이터는 따로 보관되어 서로 지워지지 않아요. 실제 농가가 쓰는 중에는 시연으로 돌리지 마세요.",
+                  "en": "Switching changes the screen for every user right away. Data of the two modes is kept separately and never erased by switching. Do not switch to demo while real herders are using the app.",
+                  "mn": "Солиход бүх хэрэглэгчийн дэлгэц шууд өөрчлөгдөнө. Хоёр горимын өгөгдөл тусдаа хадгалагддаг тул солиход устахгүй. Бодит малчид ашиглаж байх үед жишээ горим руу бүү шилжүүл."},
+ "mode_pin_ph":  {"ko": "관리자 PIN 다시 입력", "en": "Enter the admin PIN again", "mn": "Удирдлагын PIN-ийг дахин оруулах"},
+ "mode_confirm_ph": {"ko": "확인을 위해 {w} 라고 입력", "en": "Type {w} to confirm", "mn": "Баталгаажуулахын тулд {w} гэж бичнэ үү"},
+ "mode_to_live": {"ko": "실제 운영으로 전환", "en": "Switch to Live", "mn": "Бодит горим руу шилжих"},
+ "mode_to_demo": {"ko": "시연 모드로 전환", "en": "Switch to Demo", "mn": "Жишээ горим руу шилжих"},
+ "mode_off":     {"ko": "이 서버에서는 전환 버튼을 쓸 수 없어요 (Neon DB와 관리자 PIN이 모두 있어야 해요).", "en": "Switching is not available on this server (needs the Neon database and an admin PIN).", "mn": "Энэ сервер дээр солих боломжгүй (Neon өгөгдлийн сан болон удирдлагын PIN хэрэгтэй)."},
+ "mode_bad":     {"ko": "잘못된 요청이에요", "en": "Invalid request", "mn": "Буруу хүсэлт"},
+ "mode_confirm_bad": {"ko": "확인 글자가 달라서 취소했어요", "en": "Confirmation text did not match — cancelled", "mn": "Баталгаажуулах үг таарахгүй — цуцлагдлаа"},
+ "mode_same":    {"ko": "이미 그 모드예요", "en": "Already in that mode", "mn": "Аль хэдийн тэр горимд байна"},
+ "msg_mode_set": {"ko": "✅ 모드를 바꿨어요: {m}", "en": "✅ Mode switched: {m}", "mn": "✅ Горим солигдлоо: {m}"},
  # 등급 · 한파
  "lv_ok":        {"ko": "정상", "en": "Normal", "mn": "Хэвийн"},
  "lv_warn":      {"ko": "주의 — 재보충 준비", "en": "Caution — prepare restock", "mn": "Анхаар — нөөц нөхөхөд бэлтгэ"},
@@ -287,10 +305,11 @@ app = Flask(__name__)
 def pick_lang():
     g.lang = request.cookies.get("lang", DEFAULT_LANG)
     if g.lang not in LANGS: g.lang = DEFAULT_LANG
+    g.mode = current_mode()                                   # 이 요청 동안 쓸 시연/운영 모드
 
 @app.context_processor
 def inject():
-    return {"t": t, "lang": g.lang, "wh_name": wh_name, "demo": DEMO_MODE, "truck": TRUCK_CAPACITY_T,
+    return {"t": t, "lang": g.lang, "wh_name": wh_name, "demo": is_demo(), "mode_switch": MODE_SWITCHABLE, "truck": TRUCK_CAPACITY_T,
             "lead": LEAD_DAYS, "bale": HAY_BALE_TON, "order_min": ORDER_MIN_T, "warehouses": WAREHOUSES,
             "horizon": FORECAST_HORIZON_D, "min_orders": MIN_ORDERS_FOR_CYCLE}
 
@@ -318,7 +337,10 @@ if USE_PG:
         from psycopg_pool import ConnectionPool
     except ImportError as e:
         raise SystemExit('DATABASE_URL 을 쓰려면  pip install "psycopg[binary]" psycopg-pool  이 필요합니다') from e
-    _pool = None
+    _pools = {}                                   # 스키마 이름 → 연결 풀 (시연 demo / 운영 live 각각)
+    _pools_lock = threading.Lock()
+    _ready = set()                                # 표 준비가 끝난 스키마
+    _ready_lock = threading.Lock()
 
 def _pg_sql(sql):
     return sql.replace("?", "%s")
@@ -327,20 +349,77 @@ def _pg_ddl(sql):
     """SQLite 식 표 만들기 문장을 PostgreSQL 용으로"""
     return re.sub(r"\bREAL\b", "DOUBLE PRECISION", sql.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY"))
 
-def _get_pool():
-    """연결 풀 (처음 쓸 때 만듦). 연결을 열어 둔 채 재사용 — 요청마다 새로 연결하면 매번 1초 넘게 걸림"""
-    global _pool
-    if _pool is None:
-        with psycopg.connect(PG_URL, connect_timeout=30, autocommit=True) as boot:     # 시연/운영 분리용 스키마 준비
-            boot.execute("SELECT pg_advisory_lock(727274)")
-            boot.execute(f"CREATE SCHEMA IF NOT EXISTS {PG_SCHEMA}")
-            boot.execute("SELECT pg_advisory_unlock(727274)")
-        pool = ConnectionPool(PG_URL, min_size=1, max_size=4, max_idle=120, open=False,
-                              kwargs={"row_factory": dict_row, "connect_timeout": 30, "options": f"-c search_path={PG_SCHEMA}"})
-        pool.open(wait=True, timeout=60)
-        atexit.register(pool.close)                           # 서버가 꺼질 때 연결을 깔끔하게 닫음
-        _pool = pool
-    return _pool
+def _get_pool(schema):
+    """스키마별 연결 풀 (처음 쓸 때 만듦). 연결을 열어 둔 채 재사용 — 요청마다 새로 연결하면 매번 1초 넘게 걸림"""
+    pool = _pools.get(schema)
+    if pool is None:
+        with _pools_lock:
+            pool = _pools.get(schema)
+            if pool is None:
+                with psycopg.connect(PG_URL, connect_timeout=30, autocommit=True) as boot:     # 시연/운영 분리용 스키마 + 모드 설정 표 준비
+                    boot.execute("SELECT pg_advisory_lock(727274)")
+                    boot.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
+                    boot.execute("CREATE TABLE IF NOT EXISTS public.haylink_settings(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT)")
+                    boot.execute("SELECT pg_advisory_unlock(727274)")
+                pool = ConnectionPool(PG_URL, min_size=1, max_size=4, max_idle=120, open=False,
+                                      kwargs={"row_factory": dict_row, "connect_timeout": 30, "options": f"-c search_path={schema}"})
+                pool.open(wait=True, timeout=60)
+                atexit.register(pool.close)                   # 서버가 꺼질 때 연결을 깔끔하게 닫음
+                _pools[schema] = pool
+    return pool
+
+# ── 시연/운영 모드 ──  PostgreSQL + PIN 이 있으면 관리자 화면 버튼으로 바꿀 수 있고, 선택한 모드는 DB(public.haylink_settings)에 저장됨.
+#    그 밖(SQLite, PIN 없음, 시험용 스키마 지정)에서는 환경변수 HAYLINK_MODE 값으로 고정.
+_mode_state = {"v": "demo" if DEMO_MODE else "live", "ts": 0.0}
+
+def current_mode():
+    """지금 모드 'demo' | 'live'. 전환 가능한 서버에서는 DB 값을 MODE_TTL_S 초마다 확인"""
+    if not MODE_SWITCHABLE: return "demo" if DEMO_MODE else "live"
+    if time.time() - _mode_state["ts"] > MODE_TTL_S:
+        def run():
+            with _get_pool(PG_SCHEMA).connection() as con:
+                r = con.execute("SELECT value FROM public.haylink_settings WHERE key = 'mode'").fetchone()
+                return r["value"] if r else None
+        try:
+            v = _pg_retry(run)
+            _mode_state["v"] = v if v in ("demo", "live") else ("demo" if DEMO_MODE else "live")   # 저장된 값이 없으면 환경변수 값이 처음 값
+        except Exception:
+            pass                                              # 읽기에 실패하면 마지막으로 알던 값을 유지
+        _mode_state["ts"] = time.time()
+    return _mode_state["v"]
+
+def set_mode(mode):
+    """모드를 DB에 저장하고 바로 적용 (다른 서버는 최대 MODE_TTL_S 초 안에 따라옴)"""
+    assert MODE_SWITCHABLE and mode in ("demo", "live")
+    def run():
+        with _get_pool(PG_SCHEMA).connection() as con:
+            con.execute("INSERT INTO public.haylink_settings(key, value, updated_at) VALUES('mode', %s, %s) "
+                        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at", (mode, now_iso()))
+    _pg_retry(run)
+    _ensure_ready(mode)                                       # 새 모드의 표·시연 데이터 준비
+    _mode_state["v"], _mode_state["ts"] = mode, time.time()
+
+def _req_mode():
+    """이 요청에서 쓰는 모드 (한 요청 안에서 중간에 바뀌지 않게 요청 시작 때 정한 값)"""
+    if has_request_context() and hasattr(g, "mode"): return g.mode
+    return current_mode()
+
+def is_demo():
+    return _req_mode() == "demo"
+
+def _ensure_ready(schema):
+    if schema not in _ready:
+        with _ready_lock:
+            if schema not in _ready:
+                _init_schema(schema)
+                _ready.add(schema)
+
+def _active_schema():
+    """지금 요청이 쓸 PostgreSQL 스키마 (SQLite 이면 None)"""
+    if not USE_PG: return None
+    sch = ("live" if _req_mode() == "live" else "demo") if MODE_SWITCHABLE else PG_SCHEMA
+    _ensure_ready(sch)
+    return sch
 
 def _pg_retry(fn):
     try: return fn()
@@ -362,9 +441,9 @@ class _Tx:
         else: self.con.executescript(sql)
 
 @contextmanager
-def transaction():
+def transaction(schema=None):
     if USE_PG:
-        with _get_pool().connection() as con: yield _Tx(con)
+        with _get_pool(schema or _active_schema()).connection() as con: yield _Tx(con)
     else:
         con = sqlite3.connect(DB_FILE); con.row_factory = sqlite3.Row
         try:
@@ -376,8 +455,9 @@ def transaction():
 
 def q(sql, args=(), one=False):
     if USE_PG:
+        sch = _active_schema()
         def run():
-            with _get_pool().connection() as con:
+            with _get_pool(sch).connection() as con:
                 cur = con.execute(_pg_sql(sql), args)
                 return cur.fetchone() if one else cur.fetchall()
         return _pg_retry(run)
@@ -390,8 +470,9 @@ def q(sql, args=(), one=False):
 
 def x(sql, args=()):
     if USE_PG:
+        sch = _active_schema()
         def run():
-            with _get_pool().connection() as con: con.execute(_pg_sql(sql), args)
+            with _get_pool(sch).connection() as con: con.execute(_pg_sql(sql), args)
         return _pg_retry(run)
     con = sqlite3.connect(DB_FILE)
     try:
@@ -402,9 +483,10 @@ def x(sql, args=()):
 _cache = {}
 def cached_rows(sql, ttl=60):
     """거의 안 바뀌는 설정 표(가격·할증)를 잠깐 기억해 DB 왕복을 줄임"""
-    hit = _cache.get(sql)
+    key = (_active_schema(), sql)                             # 시연/운영이 서로 다른 스키마라 구분해서 기억
+    hit = _cache.get(key)
     if hit and time.time() - hit[1] < ttl: return hit[0]
-    rows = q(sql); _cache[sql] = (rows, time.time()); return rows
+    rows = q(sql); _cache[key] = (rows, time.time()); return rows
 
 def now_iso():
     return datetime.datetime.now().isoformat(timespec="seconds")
@@ -448,21 +530,26 @@ SCHEMA_SQL = """
     CREATE INDEX IF NOT EXISTS idx_request_log ON request_log(ts);
 """
 
-def init_db():
-    """표 만들기 + (시연 모드이고 데이터가 비었으면) 시연 데이터 넣기. 서버가 여러 개 동시에 켜져도 한 번만 되도록 PostgreSQL 에서는 잠금을 씀"""
-    with transaction() as tx:
+def _init_schema(schema):
+    """표 만들기 + (시연 데이터 칸이고 데이터가 비었으면) 시연 데이터 넣기. 서버가 여러 개 동시에 켜져도 한 번만 되도록 PostgreSQL 에서는 잠금을 씀"""
+    seed = (schema == "demo") if MODE_SWITCHABLE else DEMO_MODE
+    with transaction(schema) as tx:
         if USE_PG: tx.execute("SELECT pg_advisory_xact_lock(727274)")
         tx.script(SCHEMA_SQL)
-        if DEMO_MODE and tx.execute("SELECT COUNT(*) AS c FROM readings").fetchone()["c"] == 0:
+        if seed and tx.execute("SELECT COUNT(*) AS c FROM readings").fetchone()["c"] == 0:
             seed_demo(tx)
+
+def init_db():
+    _init_schema(_active_schema())
 
 def reset_demo_db():
     """시연 데이터를 지우고 다시 만듦. PostgreSQL 에서는 현재 스키마(demo)의 데이터 표만 비워서, 가격·할증 표와 운영(live) 데이터는 그대로 둠"""
+    sch = _active_schema()
     if USE_PG:
-        with transaction() as tx: tx.execute("TRUNCATE readings, orders, deliveries, request_log RESTART IDENTITY")
+        with transaction(sch) as tx: tx.execute("TRUNCATE readings, orders, deliveries, request_log RESTART IDENTITY")
     elif os.path.exists(DB_FILE):
         os.remove(DB_FILE)
-    init_db()
+    _init_schema(sch)
 
 # 시연 시나리오: 창고별 현재 재고(%)와 농가 목록. 날짜는 초기화한 시점 기준으로 만들어져 언제 초기화해도 같은 상황이 재현됨.
 # 농가 = (이름, 전화, 1회 주문량 t, 주문 주기 일, 다음 주문까지 남은 일, 지금 대기 중인 신청량 t, 신청 경로)
@@ -1205,6 +1292,16 @@ ADMIN = """{% extends "base.html" %}{% block content %}
   <input name="distance_cm" type="number" step="0.1" min="0" placeholder="{{ t('dist_test') }}" required>
   <button class="secondary" type="submit">{{ t('send_test') }}</button></form>
  {% if demo %}<form method="post" action="/api/demo/reset" style="margin-top:6px"><button class="danger" type="submit">{{ t('reset') }}</button></form>{% endif %}</div>
+<div class="card"><h2>{{ t('mode_title') }}</h2>
+ <p style="margin:0 0 6px">{{ t('mode_now') }}: <b>{{ t('mode_demo') if demo else t('mode_live') }}</b></p>
+ {% if mode_switch %}
+ <p class="muted" style="margin:0 0 6px">{{ t('mode_warn') }}</p>
+ <form method="post" action="/admin/mode">
+  <input type="hidden" name="target" value="{{ 'live' if demo else 'demo' }}">
+  <input name="pin" type="password" placeholder="{{ t('mode_pin_ph') }}" required autocomplete="off">
+  <input name="confirm" placeholder="{{ t('mode_confirm_ph', w='LIVE' if demo else 'DEMO') }}" required autocomplete="off">
+  <button class="danger" type="submit">{{ t('mode_to_live') if demo else t('mode_to_demo') }}</button></form>
+ {% else %}<p class="muted" style="margin:0">{{ t('mode_off') }}</p>{% endif %}</div>
 {% endblock %}"""
 
 PIN = """{% extends "base.html" %}{% block content %}
@@ -1346,7 +1443,7 @@ def dispatch(wid):
     with transaction() as tx:
         tx.execute("UPDATE orders SET status='dispatched' WHERE warehouse_id=? AND status='pending'", (wid,))
         tx.execute("INSERT INTO deliveries(warehouse_id, total_tons, n_orders, ts) VALUES(?,?,?,?)", (wid, a["pend"], a["n"], now_iso()))
-    if DEMO_MODE:
+    if is_demo():
         # 실서비스에선 센서가 반출을 감지함. 데모에선 반출 후 측정값을 직접 기록해 재고를 맞춘다.
         record_reading(w, pct=max(0.0, p["cur_pct"] - a["pend"] / w["capacity_ton"] * 100))
     return redirect(msg_url("/order", "msg_dispatch", wh=wh_name(wid), tons=f"{a['pend']:.1f}", hh=t("households", n=a["n"])))
@@ -1444,7 +1541,7 @@ def api_warehouses():
 @app.route("/api/demo/consume/<wid>", methods=["POST"])
 def demo_consume(wid):
     w = WH_BY_ID.get(wid)
-    if not w or not DEMO_MODE: return "not found", 404
+    if not w or not is_demo(): return "not found", 404
     last = latest_reading(wid)
     cur = float(last["stock_pct"]) if last else 50.0
     new_pct = record_reading(w, pct=max(0.0, cur - HAY_BALE_TON / w["capacity_ton"] * 100))  # v0.2의 ×3 버그 제거
@@ -1453,9 +1550,25 @@ def demo_consume(wid):
 @app.route("/api/demo/reset", methods=["POST"])
 @admin_required
 def demo_reset():
-    if not DEMO_MODE: return "not found", 404
+    if not is_demo(): return "not found", 404
     reset_demo_db()
     return redirect(msg_url("/admin", "msg_reset"))
+
+@app.route("/admin/mode", methods=["POST"])
+@admin_required
+def admin_mode():
+    """시연 ↔ 운영 전환. PIN 다시 입력 + 확인 글자(LIVE/DEMO) 입력이 모두 맞아야 바뀜"""
+    if not MODE_SWITCHABLE: return "not found", 404
+    f = request.form
+    target = f.get("target", "")
+    if target not in ("demo", "live"): return redirect(msg_url("/admin", "mode_bad", kind="err"))
+    if not hmac.compare_digest(f.get("pin", "").encode(), ADMIN_PIN.encode()):
+        return redirect(msg_url("/admin", "pin_bad", kind="err"))
+    if f.get("confirm", "").strip().upper() != target.upper():
+        return redirect(msg_url("/admin", "mode_confirm_bad", kind="err"))
+    if target == current_mode(): return redirect(msg_url("/admin", "mode_same", kind="err"))
+    set_mode(target)
+    return redirect(msg_url("/admin", "msg_mode_set", m=t("mode_" + target)))
 
 init_db()
 
