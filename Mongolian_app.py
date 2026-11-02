@@ -3,7 +3,8 @@
 #  모바일 UI + 3개 언어 (ko / en / mn)
 #  실행: python Mongolian_app.py  →  브라우저 http://127.0.0.1:5000   (폰: http://노트북IP:5000)
 #  필요: pip install flask
-#  선택: 환경변수 HAYLINK_MODE=live  → 운영 모드 (가짜 데이터·시연 버튼 없음, DB 파일도 haylink_live.db 로 분리). 기본은 demo
+#  선택: 환경변수 DATABASE_URL=postgresql://...  → PostgreSQL(Neon)에 저장 (없으면 SQLite 파일). 시연·운영 데이터는 DB 안 demo / live 스키마로 분리
+#  선택: 환경변수 HAYLINK_MODE=live → 운영 모드 (가짜 데이터·시연 버튼 없음, DB 파일도 haylink_live.db 로 분리). 기본은 demo
 #  선택: 환경변수 HAYLINK_ADMIN_PIN=1234 → 관리자 화면·데모 초기화·대리 신청에 PIN 요구 (미설정 시 열림)
 #
 #  v0.3 변경점
@@ -17,12 +18,19 @@ from flask import Flask, request, jsonify, render_template, redirect, g, Respons
 from jinja2 import DictLoader
 from urllib.parse import quote, urlparse
 from functools import wraps
-import sqlite3, datetime, random, json, urllib.request, os, re, csv, io
+import sqlite3, datetime, random, json, urllib.request, os, re, csv, io, time, atexit
+from contextlib import contextmanager
 
 # ─────────────── 설정 ───────────────
 APP_MODE         = os.environ.get("HAYLINK_MODE", "demo").strip().lower()   # demo: 시연(가짜 데이터·시연 버튼) | live: 운영(실제 데이터만)
 DEMO_MODE        = APP_MODE != "live"
-DB_FILE          = "haylink.db" if DEMO_MODE else "haylink_live.db"        # 시연 DB와 운영 DB 파일을 분리해 섞이지 않게 함
+DB_FILE          = "haylink.db" if DEMO_MODE else "haylink_live.db"        # (SQLite 일 때) 시연 DB와 운영 DB 파일을 분리해 섞이지 않게 함
+DATABASE_URL     = os.environ.get("DATABASE_URL", "").strip()              # 있으면 PostgreSQL(Neon), 없으면 SQLite 파일
+USE_PG           = DATABASE_URL.startswith(("postgres://", "postgresql://"))
+PG_URL           = DATABASE_URL.replace("-pooler", "", 1)                   # 연결 풀을 앱이 직접 관리하므로 direct 주소를 씀 (pooled 주소를 넣어도 자동 변환)
+PG_SCHEMA        = os.environ.get("HAYLINK_PG_SCHEMA") or ("demo" if DEMO_MODE else "live")   # (PostgreSQL 일 때) 시연·운영 데이터를 한 DB 안에서 분리
+if USE_PG and not re.fullmatch(r"[a-z_][a-z0-9_]*", PG_SCHEMA):
+    raise SystemExit("HAYLINK_PG_SCHEMA 는 영문 소문자·숫자·밑줄만 쓸 수 있습니다")
 TRUCK_CAPACITY_T = 5.0           # 트럭 1대 분량(톤)
 LEAD_DAYS        = 3             # 재보충 소요일
 HAY_BALE_TON     = 0.35          # 시연용 건초 1묶음
@@ -301,11 +309,79 @@ def admin_required(f):
     return inner
 
 # ═══════════════════ DB ═══════════════════
-def db():
-    con = sqlite3.connect(DB_FILE); con.row_factory = sqlite3.Row; return con
+# DB 는 q(조회)·x(저장)·transaction(여러 개를 한 번에) 세 통로로만 접근. SQL 은 '?' 자리표시자와 SQLite·PostgreSQL 공통 문법으로 쓰고,
+# PostgreSQL 일 때는 아래에서 자동으로 바꿔 줌. 조회 결과는 row["열이름"] 으로 읽음.
+if USE_PG:
+    try:
+        import psycopg
+        from psycopg.rows import dict_row
+        from psycopg_pool import ConnectionPool
+    except ImportError as e:
+        raise SystemExit('DATABASE_URL 을 쓰려면  pip install "psycopg[binary]" psycopg-pool  이 필요합니다') from e
+    _pool = None
+
+def _pg_sql(sql):
+    return sql.replace("?", "%s")
+
+def _pg_ddl(sql):
+    """SQLite 식 표 만들기 문장을 PostgreSQL 용으로"""
+    return re.sub(r"\bREAL\b", "DOUBLE PRECISION", sql.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY"))
+
+def _get_pool():
+    """연결 풀 (처음 쓸 때 만듦). 연결을 열어 둔 채 재사용 — 요청마다 새로 연결하면 매번 1초 넘게 걸림"""
+    global _pool
+    if _pool is None:
+        with psycopg.connect(PG_URL, connect_timeout=30, autocommit=True) as boot:     # 시연/운영 분리용 스키마 준비
+            boot.execute("SELECT pg_advisory_lock(727274)")
+            boot.execute(f"CREATE SCHEMA IF NOT EXISTS {PG_SCHEMA}")
+            boot.execute("SELECT pg_advisory_unlock(727274)")
+        pool = ConnectionPool(PG_URL, min_size=1, max_size=4, max_idle=120, open=False,
+                              kwargs={"row_factory": dict_row, "connect_timeout": 30, "options": f"-c search_path={PG_SCHEMA}"})
+        pool.open(wait=True, timeout=60)
+        atexit.register(pool.close)                           # 서버가 꺼질 때 연결을 깔끔하게 닫음
+        _pool = pool
+    return _pool
+
+def _pg_retry(fn):
+    try: return fn()
+    except (psycopg.OperationalError, psycopg.InterfaceError):    # 끊긴 연결(Neon 대기 상태 등)이면 새 연결로 한 번 더
+        return fn()
+
+class _Tx:
+    """한 묶음의 DB 작업: 끝나면 저장, 오류가 나면 모두 되돌림"""
+    def __init__(self, con): self.con = con
+    def execute(self, sql, args=()):
+        return self.con.execute(_pg_sql(sql) if USE_PG else sql, args)
+    def executemany(self, sql, rows):
+        if USE_PG:
+            with self.con.cursor() as cur: cur.executemany(_pg_sql(sql), rows)
+        else:
+            self.con.executemany(sql, rows)
+    def script(self, sql):
+        if USE_PG: self.con.execute(_pg_ddl(sql))
+        else: self.con.executescript(sql)
+
+@contextmanager
+def transaction():
+    if USE_PG:
+        with _get_pool().connection() as con: yield _Tx(con)
+    else:
+        con = sqlite3.connect(DB_FILE); con.row_factory = sqlite3.Row
+        try:
+            yield _Tx(con); con.commit()
+        except Exception:
+            con.rollback(); raise
+        finally:
+            con.close()
 
 def q(sql, args=(), one=False):
-    con = db()
+    if USE_PG:
+        def run():
+            with _get_pool().connection() as con:
+                cur = con.execute(_pg_sql(sql), args)
+                return cur.fetchone() if one else cur.fetchall()
+        return _pg_retry(run)
+    con = sqlite3.connect(DB_FILE); con.row_factory = sqlite3.Row
     try:
         cur = con.execute(sql, args)
         return cur.fetchone() if one else cur.fetchall()
@@ -313,18 +389,27 @@ def q(sql, args=(), one=False):
         con.close()
 
 def x(sql, args=()):
-    con = db()
+    if USE_PG:
+        def run():
+            with _get_pool().connection() as con: con.execute(_pg_sql(sql), args)
+        return _pg_retry(run)
+    con = sqlite3.connect(DB_FILE)
     try:
         con.execute(sql, args); con.commit()
     finally:
         con.close()
 
+_cache = {}
+def cached_rows(sql, ttl=60):
+    """거의 안 바뀌는 설정 표(가격·할증)를 잠깐 기억해 DB 왕복을 줄임"""
+    hit = _cache.get(sql)
+    if hit and time.time() - hit[1] < ttl: return hit[0]
+    rows = q(sql); _cache[sql] = (rows, time.time()); return rows
+
 def now_iso():
     return datetime.datetime.now().isoformat(timespec="seconds")
 
-def init_db():
-    con = db(); cur = con.cursor()
-    cur.executescript("""
+SCHEMA_SQL = """
     CREATE TABLE IF NOT EXISTS readings(id INTEGER PRIMARY KEY AUTOINCREMENT, warehouse_id TEXT, distance_cm REAL, stock_pct REAL, ts TEXT);
     CREATE TABLE IF NOT EXISTS orders(id INTEGER PRIMARY KEY AUTOINCREMENT, warehouse_id TEXT, herder TEXT, phone TEXT, tons REAL, channel TEXT, status TEXT, ts TEXT);
     CREATE TABLE IF NOT EXISTS deliveries(id INTEGER PRIMARY KEY AUTOINCREMENT, warehouse_id TEXT, total_tons REAL, n_orders INTEGER, ts TEXT);
@@ -339,31 +424,45 @@ def init_db():
         normal_price_mnt INTEGER NOT NULL,       -- 가을 평시 가격
         dzud_peak_price_mnt INTEGER NOT NULL,    -- 조드 피크 시세
         subsidized_price_mnt INTEGER NOT NULL);  -- 정부·국제기구 구호 단가
-    INSERT OR IGNORE INTO feed_items (item_code, name_ko, name_mn, name_en, unit, normal_price_mnt, dzud_peak_price_mnt, subsidized_price_mnt) VALUES
+    INSERT INTO feed_items (item_code, name_ko, name_mn, name_en, unit, normal_price_mnt, dzud_peak_price_mnt, subsidized_price_mnt) VALUES
         ('HAY_BALE', '천연 건초 (25kg 묶음)', 'Байгалийн өвс (25кг боодол)', 'Natural Hay Bale (25kg)', 'bale', 6000, 18000, 9000),
         ('WHEAT_BRAN', '밀기울 농축사료 (25kg 포대)', 'Хүчит тэжээл / Хивэг (25кг)', 'Wheat Bran Fodder (25kg)', 'bag', 10000, 32000, 15000),
-        ('MINERAL_BLOCK', '미네랄 블록 (30kg)', 'Эрдэс долооц (30кг)', 'Mineral Lick Block (30kg)', 'block', 15000, 35000, 18000);
+        ('MINERAL_BLOCK', '미네랄 블록 (30kg)', 'Эрдэс долооц (30кг)', 'Mineral Lick Block (30kg)', 'block', 15000, 35000, 18000)
+        ON CONFLICT DO NOTHING;
 
     -- 날씨 단계별 운송비 할증 배율. min_temp: 이 기온보다 따뜻해야 해당 단계, max_snow_cm: 적설이 이보다 적어야 해당 단계
     CREATE TABLE IF NOT EXISTS weather_delivery_rates(
         rate_id INTEGER PRIMARY KEY AUTOINCREMENT, condition_code TEXT UNIQUE NOT NULL, condition_name_ko TEXT NOT NULL,
         min_temp REAL, max_snow_cm REAL, cost_multiplier REAL NOT NULL, description TEXT);
-    INSERT OR IGNORE INTO weather_delivery_rates (condition_code, condition_name_ko, min_temp, max_snow_cm, cost_multiplier, description) VALUES
+    INSERT INTO weather_delivery_rates (condition_code, condition_name_ko, min_temp, max_snow_cm, cost_multiplier, description) VALUES
         ('NORMAL', '정상 운송', -15.0, 5.0, 1.0, '평시 초원 도로 운행 가능'),
         ('WARNING', '조드 주의 (한파/결빙)', -25.0, 10.0, 1.3, '영하 15~25도 한파, 디젤 결빙 위험 및 원거리 60~70% 운임 상승 반영'),
         ('CRITICAL', '조드 경보 (폭설/고립)', -35.0, 15.0, 1.8, '적설량 10cm 이상, 4WD 특수 트럭 투입 및 도로 통제'),
-        ('EMERGENCY', '조드 비상재난 (도로 전면통제)', -50.0, 999.0, 2.5, '제설차량 동반 및 비상 수송 단계');
+        ('EMERGENCY', '조드 비상재난 (도로 전면통제)', -50.0, 999.0, 2.5, '제설차량 동반 및 비상 수송 단계')
+        ON CONFLICT DO NOTHING;
 
     -- 신청 시도 기록: 성공·실패 모두. reason = ok / bad_input / wh_short / over_stock / sms_format / sms_no_warehouse / sms_number
     CREATE TABLE IF NOT EXISTS request_log(
         id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, warehouse_id TEXT, herder TEXT, phone TEXT, tons REAL,
         channel TEXT, ok INTEGER NOT NULL, reason TEXT, stock_t REAL, avail_t REAL, pending_t REAL, lang TEXT, raw TEXT);
     CREATE INDEX IF NOT EXISTS idx_request_log ON request_log(ts);
-    """)
-    con.commit()
-    if DEMO_MODE and cur.execute("SELECT COUNT(*) FROM readings").fetchone()[0] == 0:
-        seed_demo(cur); con.commit()
-    con.close()
+"""
+
+def init_db():
+    """표 만들기 + (시연 모드이고 데이터가 비었으면) 시연 데이터 넣기. 서버가 여러 개 동시에 켜져도 한 번만 되도록 PostgreSQL 에서는 잠금을 씀"""
+    with transaction() as tx:
+        if USE_PG: tx.execute("SELECT pg_advisory_xact_lock(727274)")
+        tx.script(SCHEMA_SQL)
+        if DEMO_MODE and tx.execute("SELECT COUNT(*) AS c FROM readings").fetchone()["c"] == 0:
+            seed_demo(tx)
+
+def reset_demo_db():
+    """시연 데이터를 지우고 다시 만듦. PostgreSQL 에서는 현재 스키마(demo)의 데이터 표만 비워서, 가격·할증 표와 운영(live) 데이터는 그대로 둠"""
+    if USE_PG:
+        with transaction() as tx: tx.execute("TRUNCATE readings, orders, deliveries, request_log RESTART IDENTITY")
+    elif os.path.exists(DB_FILE):
+        os.remove(DB_FILE)
+    init_db()
 
 # 시연 시나리오: 창고별 현재 재고(%)와 농가 목록. 날짜는 초기화한 시점 기준으로 만들어져 언제 초기화해도 같은 상황이 재현됨.
 # 농가 = (이름, 전화, 1회 주문량 t, 주문 주기 일, 다음 주문까지 남은 일, 지금 대기 중인 신청량 t, 신청 경로)
@@ -387,16 +486,17 @@ DEMO_SCENARIOS = {
         ("Tumur", "9911-0034", 1.5, 14, 5, 0, "app")]},
 }
 
-def seed_demo(cur):
+def seed_demo(tx):
     """시연용 가짜 데이터 (시드 고정). 창고마다 다른 상황으로 '농가 주문 기반 매진 예측'을 보여 줌:
        준모드=곧 매진(위험), 알탄불락=며칠 뒤 매진(주의), 바양=여유(안정), 세르겔렌=이미 재고 부족(신청 차단).
        ① 농가별 과거 주문 기록 8회 ② 그 소비 속도에 맞춰 줄어든 14일치 재고 측정값(6시간 간격) ③ 지금 대기 중인 신청"""
     random.seed(42)
     now = datetime.datetime.now(); today = now.date()
 
+    readings, orders, logs = [], [], []                                            # 모아 두었다가 한꺼번에 저장 (외부 DB 왕복을 줄임)
+
     def seed_log(ts, wid, herder, phone, tons, channel, ok, reason, raw=None):     # 신청 시도 기록 (통계 화면 시연용)
-        cur.execute("INSERT INTO request_log(ts, warehouse_id, herder, phone, tons, channel, ok, reason, lang, raw) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                    (ts, wid, herder, phone, tons, channel, 1 if ok else 0, reason, "ko", raw))
+        logs.append((ts, wid, herder, phone, tons, channel, 1 if ok else 0, reason, "ko", raw))
 
     for w in WAREHOUSES:
         sc = DEMO_SCENARIOS[w["id"]]
@@ -406,8 +506,7 @@ def seed_demo(cur):
             noise = 0.0 if age_days == 0 else random.uniform(-0.8, 0.8)
             pct = max(2, sc["stock_pct"] + per_day * age_days + noise)
             ts = now - datetime.timedelta(days=age_days)
-            cur.execute("INSERT INTO readings VALUES(NULL,?,?,?,?)",
-                        (w["id"], round(pct_to_distance(w, pct), 1), round(pct, 1), ts.isoformat(timespec="seconds")))
+            readings.append((w["id"], round(pct_to_distance(w, pct), 1), round(pct, 1), ts.isoformat(timespec="seconds")))
         for name, phone, tons, interval, due_in, pending, channel in sc["herders"]:
             # 마지막으로 받아 간 날: 대기 신청이 있으면 한 주기 전, 없으면 '다음 주문일 - 주기'
             d = today - datetime.timedelta(days=interval) if pending else today + datetime.timedelta(days=due_in - interval)
@@ -415,12 +514,11 @@ def seed_demo(cur):
             for k in range(8):
                 qty = max(0.5, round(tons * random.uniform(0.85, 1.15), 1))
                 order_ts = datetime.datetime.combine(d, datetime.time(9, 0)).isoformat(timespec="seconds")
-                cur.execute("INSERT INTO orders VALUES(NULL,?,?,?,?,?,?,?)", (w["id"], name, phone, qty, channel, "dispatched", order_ts))
+                orders.append((w["id"], name, phone, qty, channel, "dispatched", order_ts))
                 seed_log(order_ts, w["id"], name, phone, qty, channel, True, "ok")
                 d -= datetime.timedelta(days=interval + (gaps[k] if k < len(gaps) else 0))
             if pending:
-                cur.execute("INSERT INTO orders VALUES(NULL,?,?,?,?,?,?,?)",
-                            (w["id"], name, phone, pending, channel, "pending", now.isoformat(timespec="seconds")))
+                orders.append((w["id"], name, phone, pending, channel, "pending", now.isoformat(timespec="seconds")))
                 seed_log(now.isoformat(timespec="seconds"), w["id"], name, phone, pending, channel, True, "ok")
     # 실패한 신청 시도: 창고 상황에 맞는 사유 (세르겔렌은 재고 부족으로 막힌 시도가 많음)
     fail_plan = {"zuunmod_01": [("over_stock", 6), ("bad_input", 3)], "altanbulag_01": [("over_stock", 4), ("bad_input", 2)],
@@ -433,6 +531,9 @@ def seed_demo(cur):
                 seed_log(ts, w["id"], random.choice(names), "", round(random.uniform(0.5, 6.0), 1), random.choice(["app", "app", "sms", "proxy"]), False, reason)
     for _ in range(4):
         seed_log((now - datetime.timedelta(days=random.uniform(0, 45))).isoformat(timespec="seconds"), None, None, "", None, "sms", False, "sms_format", raw="haylink 2 Bold")
+    tx.executemany("INSERT INTO readings(warehouse_id, distance_cm, stock_pct, ts) VALUES(?,?,?,?)", readings)
+    tx.executemany("INSERT INTO orders(warehouse_id, herder, phone, tons, channel, status, ts) VALUES(?,?,?,?,?,?,?)", orders)
+    tx.executemany("INSERT INTO request_log(ts, warehouse_id, herder, phone, tons, channel, ok, reason, lang, raw) VALUES(?,?,?,?,?,?,?,?,?,?)", logs)
 
 # ═══════════════════ 계산 ═══════════════════
 def distance_to_pct(w, d):
@@ -445,7 +546,7 @@ def record_reading(w, dist=None, pct=None):
     """거리(cm) 또는 재고(%) 중 하나로 측정값 기록"""
     if dist is None: dist = pct_to_distance(w, pct)
     if pct is None:  pct = distance_to_pct(w, dist)
-    x("INSERT INTO readings VALUES(NULL,?,?,?,?)", (w["id"], round(dist, 1), round(pct, 1), now_iso()))
+    x("INSERT INTO readings(warehouse_id, distance_cm, stock_pct, ts) VALUES(?,?,?,?)", (w["id"], round(dist, 1), round(pct, 1), now_iso()))
     return round(pct, 1)
 
 def latest_reading(wid):
@@ -634,7 +735,7 @@ def availability(w, p=None):
 def weather_level(temp_celsius, snow_depth_cm=None):
     """기온·적설량으로 날씨 단계와 운송비 할증 배율을 구함 (기준은 weather_delivery_rates 표).
        '기온이 min_temp 보다 높고 적설이 max_snow_cm 보다 적은' 첫 단계. 모두 넘으면 가장 높은 단계. 값이 None 이면 그 조건은 무시."""
-    rows = q("SELECT condition_code, min_temp, max_snow_cm, cost_multiplier FROM weather_delivery_rates ORDER BY cost_multiplier")
+    rows = cached_rows("SELECT condition_code, min_temp, max_snow_cm, cost_multiplier FROM weather_delivery_rates ORDER BY cost_multiplier")
     if not rows: return "NORMAL", 1.0
     for r in rows:
         if ((temp_celsius is None or r["min_temp"] is None or temp_celsius > r["min_temp"])
@@ -694,7 +795,7 @@ def try_add_order(wid, herder, phone, tons, channel):
     if tons > a["avail"] + 1e-9:
         log_request(False, "over_stock", wid, herder, phone, tons, channel, **seen)
         return False, "msg_over_stock", {"wh": wh_name(wid), "tons": tons, "avail": a["avail"], "stock": a["stock"], "pend": a["pend"]}
-    x("INSERT INTO orders VALUES(NULL,?,?,?,?,?,?,?)", (wid, herder, phone, tons, channel, "pending", now_iso()))
+    x("INSERT INTO orders(warehouse_id, herder, phone, tons, channel, status, ts) VALUES(?,?,?,?,?,?,?)", (wid, herder, phone, tons, channel, "pending", now_iso()))
     log_request(True, "ok", wid, herder, phone, tons, channel, **seen)
     return True, "msg_order_ok", {"name": herder, "tons": tons, "wh": wh_name(wid), "avail": round(a["avail"] - tons, 1)}
 
@@ -847,14 +948,14 @@ def warehouse_context():
 def cost_context():
     """AI에게 알려 줄 사료 가격·배송비 추정치 (조드 시세 기준 참고값, 공식·확정 가격 아님)"""
     lines = []
-    for i in q("SELECT item_code, name_en, unit, normal_price_mnt, dzud_peak_price_mnt, subsidized_price_mnt FROM feed_items"):
+    for i in cached_rows("SELECT item_code, name_en, unit, normal_price_mnt, dzud_peak_price_mnt, subsidized_price_mnt FROM feed_items"):
         lines.append(f"- {i['name_en']} per {i['unit']}: normal-season {i['normal_price_mnt']:,} MNT, dzud-peak market {i['dzud_peak_price_mnt']:,} MNT, "
                      f"relief (subsidized) {i['subsidized_price_mnt']:,} MNT")
         if i["item_code"] == "HAY_BALE":
             lines.append(f"- Natural hay per ton (= {BALES_PER_TON} bales of 25 kg): normal-season about {i['normal_price_mnt'] * BALES_PER_TON:,} MNT, "
                          f"dzud-peak market about {i['dzud_peak_price_mnt'] * BALES_PER_TON:,} MNT, relief about {i['subsidized_price_mnt'] * BALES_PER_TON:,} MNT")
     lines.append(f"Delivery fee estimate = (base {BASE_FARE_MNT:,} MNT + {PER_KM_FARE_MNT:,} MNT per km) x weather multiplier; the truck fee is split among the households sharing the delivery.")
-    for r in q("SELECT condition_code, condition_name_ko, cost_multiplier FROM weather_delivery_rates ORDER BY cost_multiplier"):
+    for r in cached_rows("SELECT condition_code, condition_name_ko, cost_multiplier FROM weather_delivery_rates ORDER BY cost_multiplier"):
         total = round((BASE_FARE_MNT + 100 * PER_KM_FARE_MNT) * r["cost_multiplier"])
         lines.append(f"  - weather level {r['condition_code']}: x{r['cost_multiplier']} -> for 100 km about {total:,} MNT per truck (about {round(total / 4):,} MNT each if 4 households share)")
     return "\n".join(lines)
@@ -1242,13 +1343,9 @@ def dispatch(wid):
         return redirect(msg_url("/order", "msg_not_enough", kind="err", n=TRUCK_CAPACITY_T))
     if not a["can_dispatch"]:
         return redirect(msg_url("/order", "msg_dispatch_short", kind="err", pend=a["pend"], stock=a["stock"]))
-    con = db()
-    try:
-        con.execute("UPDATE orders SET status='dispatched' WHERE warehouse_id=? AND status='pending'", (wid,))
-        con.execute("INSERT INTO deliveries VALUES(NULL,?,?,?,?)", (wid, a["pend"], a["n"], now_iso()))
-        con.commit()
-    finally:
-        con.close()
+    with transaction() as tx:
+        tx.execute("UPDATE orders SET status='dispatched' WHERE warehouse_id=? AND status='pending'", (wid,))
+        tx.execute("INSERT INTO deliveries(warehouse_id, total_tons, n_orders, ts) VALUES(?,?,?,?)", (wid, a["pend"], a["n"], now_iso()))
     if DEMO_MODE:
         # 실서비스에선 센서가 반출을 감지함. 데모에선 반출 후 측정값을 직접 기록해 재고를 맞춘다.
         record_reading(w, pct=max(0.0, p["cur_pct"] - a["pend"] / w["capacity_ton"] * 100))
@@ -1357,8 +1454,7 @@ def demo_consume(wid):
 @admin_required
 def demo_reset():
     if not DEMO_MODE: return "not found", 404
-    if os.path.exists(DB_FILE): os.remove(DB_FILE)
-    init_db()
+    reset_demo_db()
     return redirect(msg_url("/admin", "msg_reset"))
 
 init_db()
