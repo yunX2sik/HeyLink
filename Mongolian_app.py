@@ -51,6 +51,7 @@ TOPIC_KEYWORDS   = {"배송": ("배송", "delivery", "shipping", "хүргэлт
                     "입고": ("입고", "재입고", "재보충", "restock", "restocking", "нөхөх"),
                     "신청": ("신청", "request", "order", "хүсэлт", "захиалга")}
 WEATHER_TTL_S    = 1800          # 현재 날씨 캐시 유효시간(초)
+FX_TTL_S         = 21600         # 환율 캐시 유효시간(초) = 6시간
 FORECAST_HORIZON_D   = 60        # 농가 주문 기반 매진 예측이 내다보는 기간(일)
 MIN_ORDERS_FOR_CYCLE = 3         # 농가의 주문 주기를 계산하는 데 필요한 최소 주문 기록 수
 BASE_FARE_MNT    = 80000        # 기본 운임(MNT) — 추정치, 공식 요금 아님
@@ -214,6 +215,7 @@ T = {
  "pin_ph":       {"ko": "PIN", "en": "PIN", "mn": "PIN"},
  "pin_btn":      {"ko": "확인", "en": "Enter", "mn": "Нэвтрэх"},
  "pin_bad":      {"ko": "PIN이 올바르지 않습니다", "en": "Wrong PIN", "mn": "PIN буруу байна"},
+ "ai_deplete":   {"ko": "AI 기반 소진 예측 날짜", "en": "AI-predicted run-out date", "mn": "AI-аар таамагласан дуусах огноо"},
  "logout":       {"ko": "로그아웃 (사용자 화면으로)", "en": "Log out (back to user view)", "mn": "Гарах (хэрэглэгчийн харагдац руу)"},
  "msg_logout":   {"ko": "로그아웃했어요. 지금은 일반 사용자 화면이에요", "en": "Logged out. You are now seeing the user view", "mn": "Гарлаа. Одоо хэрэглэгчийн харагдац байна"},
  # 운영 모드 전환 (관리자)
@@ -699,9 +701,10 @@ def cold_factor(tm):
     return 1.0, "cold_normal"
 
 def privacy_on():
-    """실제 운영 모드에서 관리자(PIN 로그인)가 아닌 사람에게는 농가 이름을 숨김. 시연 모드의 가짜 이름은 그대로 보여 줌"""
-    is_admin = bool(ADMIN_PIN) and has_request_context() and admin_ok()
-    return not is_demo() and not is_admin
+    """농가별 신청 내역을 숨기고 예측 날짜만 보여 줄지.
+       PIN 이 있는 서버: 관리자(PIN 로그인)가 아닌 모든 사람(시연 모드 포함). PIN 이 없는 서버: 관리자를 가릴 수 없으니 실제 운영 모드에서만"""
+    if ADMIN_PIN: return not (has_request_context() and admin_ok())
+    return not is_demo()
 
 def herder_cycles(wid):
     """농가별 주문 습관. 농가 구분은 전화번호(없으면 이름). 주문 기록이 MIN_ORDERS_FOR_CYCLE 회 이상이면
@@ -1012,6 +1015,32 @@ def suggest_questions(text):
 
 LANG_NAME = {"ko": "Korean", "en": "English", "mn": "Mongolian"}
 
+_fx = {"data": None, "ts": 0.0, "fail": 0.0}
+
+def fetch_fx():
+    """투그릭(MNT)·원(KRW)·달러(USD) 환율. 무료·키 불필요(open.er-api.com), 6시간 기억. 실패하면 5분 뒤 다시 시도하고 그동안은 이전 값(없으면 None)"""
+    now = time.time()
+    if _fx["data"] and now - _fx["ts"] < FX_TTL_S: return _fx["data"]
+    if now - _fx["fail"] < 300: return _fx["data"]
+    try:
+        req = urllib.request.Request("https://open.er-api.com/v6/latest/USD", headers={"User-Agent": "HayLinkLite"})
+        with urllib.request.urlopen(req, timeout=4) as r: d = json.load(r)
+        mnt, krw = float(d["rates"]["MNT"]), float(d["rates"]["KRW"])
+        if not (mnt > 0 and krw > 0): raise ValueError("bad rate")
+        _fx["data"] = {"mnt_per_usd": mnt, "mnt_per_100krw": mnt / krw * 100, "krw_per_1000mnt": krw / mnt * 1000,
+                       "krw_per_usd": krw, "date": (d.get("time_last_update_utc") or "")[5:16]}
+        _fx["ts"] = now
+    except Exception:
+        _fx["fail"] = now
+    return _fx["data"]
+
+def fx_context():
+    d = fetch_fx()
+    if not d: return "Exchange rates: not available right now (say you cannot check the rate at the moment; do not guess a number)."
+    return (f"Exchange rates (reference only, market mid-rate, may differ from bank rates; updated {d['date']} UTC): "
+            f"1 USD = about {d['mnt_per_usd']:,.0f} MNT; 100 KRW (Korean won) = about {d['mnt_per_100krw']:,.0f} MNT; "
+            f"1,000 MNT = about {d['krw_per_1000mnt']:,.0f} KRW; 1 USD = about {d['krw_per_usd']:,.0f} KRW.")
+
 # 챗봇에게 알려 줄 날씨 단계 이름: 코드(NORMAL)나 배율(x1.3) 대신 사람이 쓰는 말로
 WEATHER_LABELS = {
     "NORMAL":    {"ko": "맑음·평소 날씨", "en": "clear / normal weather", "mn": "цэлмэг, ердийн цаг агаар"},
@@ -1109,8 +1138,11 @@ def ask_llm(text, history):
         "Never say for certain that hay or delivery is free or must be paid for; say it depends (relief supply may be cheaper or supported) and the administrator confirms. "
         "For a 'free?' question, do not begin with 'yes' or 'no': begin with 'it depends'. "
         "Write dzud as 조드 in Korean and as зуд in Mongolian, using only that one word (never add another language in parentheses). "
-        "Do not invent prices or distances that are not given below.\n\n"
-        "Current warehouse data:\n" + warehouse_context() + "\n\nPrice and delivery cost estimates (reference only):\n" + cost_context()
+        "Do not invent prices or distances that are not given below. "
+        "For currency or exchange-rate questions (MNT, KRW, USD) use only the exchange rates below: answer with the rate in one short line, say 'about', "
+        "and add that the bank rate may differ and the rate changes daily. Convert amounts only when asked, using those rates. "
+        "If the rates are not available, say you cannot check the rate right now; never guess a rate.\n\n"
+        "Current warehouse data:\n" + warehouse_context() + "\n\nPrice and delivery cost estimates (reference only):\n" + cost_context() + "\n\n" + fx_context()
     )
     msgs = [{"role": "user" if h["role"] == "user" else "model", "parts": [{"text": str(h["content"])[:1000]}]}
             for h in history[-CHAT_MAX_TURNS:]
@@ -1220,7 +1252,8 @@ DETAIL = """{% extends "base.html" %}{% block content %}
  <div style="display:flex;align-items:baseline;gap:10px"><span class="big">{{ p.cur_pct }}%</span><span class="muted">≈ {{ p.cur_ton }}t / {{ w.capacity_ton }}t</span></div>
  <div class="gauge"><div class="{{ p.level }}" style="width:{{ p.cur_pct }}%"></div></div>
  <div class="muted">{{ t('last_reading') }}: {{ p.last_ts }}</div></div>
-<div class="card"><div class="muted">{{ t('forecast') }}</div>
+{% if privacy %}<div class="card"><div class="muted">{{ t('ai_deplete') }}</div><span class="big">{{ p.deplete_date }}</span></div>
+{% else %}<div class="card"><div class="muted">{{ t('forecast') }}</div>
  <div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap"><span class="big">{{ p.deplete_date }}</span>
   {% if p.stockout_source %}<span class="badge {{ p.level }}">{{ t('src_' ~ p.stockout_source) }}</span>{% endif %}</div>
  {% if p.days_base is not none %}<div class="muted">{{ t('src_sensor') }}: {{ t('base_days', a=p.days_base, b=p.days_cold) }}</div>{% endif %}
@@ -1244,7 +1277,7 @@ DETAIL = """{% extends "base.html" %}{% block content %}
  {% for h in f.herders %}<div class="item"><span>{{ h.name }}{% if h.pending_t %} <span class="badge warn">{{ t('of_pending', t=h.pending_t) }}</span>{% endif %}</span>
   <span class="muted">{% if h.interval_d %}{{ t('of_habit', t=h.avg_t, d=h.interval_d, nx=h.next) }}{% else %}{{ t('of_few', n=h.n_orders) }}{% endif %}</span></div>{% endfor %}{% endif %}
  <div class="muted" style="margin-top:8px">{% if not privacy %}{{ t('of_used', m=f.n_used, n=f.n_herders) }} · {% endif %}{{ t('of_note') }}</div>
-{% endif %}</div>
+{% endif %}</div>{% endif %}
 <div class="card"><h2>{{ t('trend') }}</h2>{{ chart|safe }}</div>
 <div class="card"><h2>{{ t('grp_this') }}</h2>
  <div class="gauge"><div class="ok" style="width:{{ (a.pend/truck*100)|round|int if a.pend<truck else 100 }}%"></div></div>
