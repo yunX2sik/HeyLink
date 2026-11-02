@@ -1,0 +1,16 @@
+# 큰 데이터(원본·압축 푼 것) — GitHub 파일 100MB 제한 초과, 사용 조건 문제
+data/
+data_extracted/
+data_extracted_dialog/
+
+# 임시·자동 생성 파일
+__pycache__/
+haylink.db
+
+# 백업·옛 버전·키 메모
+Mongolian_app_backup_*.py
+Mongolian_app_v02_chatbot.py
+질문 데이터.txt
+gemini 키.txt
+*.key
+.env

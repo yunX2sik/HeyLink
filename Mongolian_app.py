@@ -16,7 +16,7 @@ from flask import Flask, request, jsonify, render_template, redirect, g
 from jinja2 import DictLoader
 from urllib.parse import quote, urlparse
 from functools import wraps
-import sqlite3, datetime, random, json, urllib.request, os
+import sqlite3, datetime, random, json, urllib.request, os, re
 
 # ─────────────── 설정 ───────────────
 DB_FILE          = "haylink.db"
@@ -28,6 +28,11 @@ ORDER_MIN_T      = 0.5           # 1회 최소 신청량
 REFILL_JUMP_PCT  = 8.0           # 측정 간 재고가 이만큼 이상 늘면 '입고'로 간주
 TEMP_TTL_S       = 3600          # 기온 캐시 유효시간(초)
 ADMIN_PIN        = os.environ.get("HAYLINK_ADMIN_PIN", "")   # 빈 문자열이면 보호 없음
+GEMINI_MODEL     = os.environ.get("HAYLINK_GEMINI_MODEL", "gemini-3.5-flash-lite")   # 챗봇용 Gemini 모델 (무료 키로 사용 가능)
+CHAT_MAX_TURNS   = 10            # AI에게 함께 보내는 이전 대화 최대 개수
+QUESTION_DB_FILE = "questions.db"   # import_questions.py 가 만드는 자주 묻는 질문 DB (데모 초기화에 지워지지 않도록 따로 둠)
+SUGGEST_COUNT    = 6                # 주제 단어만 입력했을 때 보여 줄 질문 버튼 수
+TOPIC_KEYWORDS   = {"배송": ("배송", "delivery", "shipping", "хүргэлт")}   # 이 단어만 입력하면 질문 버튼 표시
 LANGS            = ("ko", "en", "mn")
 DEFAULT_LANG     = "ko"
 SAFE_BACK        = {"/order", "/admin"}
@@ -67,6 +72,7 @@ T = {
  "chat_hello":   {"ko": "안녕하세요! 궁금한 점을 입력해 주세요. 예) 배송이 언제 오나요?", "en": "Hello! Type your question. e.g. When will my delivery arrive?", "mn": "Сайн байна уу! Асуултаа бичнэ үү. жишээ нь: Хүргэлт хэзээ ирэх вэ?"},
  "chat_ph":      {"ko": "질문을 입력하세요", "en": "Type your question", "mn": "Асуултаа бичнэ үү"},
  "chat_send":    {"ko": "보내기", "en": "Send", "mn": "Илгээх"},
+ "chat_pick":    {"ko": "많이 묻는 질문이에요. 궁금한 걸 골라 주세요 👇", "en": "These are frequently asked. Pick one 👇", "mn": "Түгээмэл асуултууд. Сонгоно уу 👇"},
  "chat_fallback":{"ko": "죄송해요, 아직 이 질문은 답을 준비하지 못했어요. 관리자에게 문의해 주세요.", "en": "Sorry, I don't have an answer for that yet. Please contact the administrator.", "mn": "Уучлаарай, энэ асуултад хараахан хариулт бэлдээгүй байна. Удирдлагад хандана уу."},
  "nav_wh":       {"ko": "창고", "en": "Warehouses", "mn": "Агуулах"},
  "nav_order":    {"ko": "배송 신청", "en": "Requests", "mn": "Хүсэлт"},
@@ -444,6 +450,67 @@ def answer_faq(text):
         if score > best_score: best, best_score = faq, score
     return best["answer"][g.lang] if best else t("chat_fallback")
 
+def suggest_questions(text):
+    """'배송'처럼 주제 단어만 입력하면, 그 주제에서 가장 많이 나온 질문을 종류(날짜·비용 등)별 1개씩 많이 나온 순으로 반환"""
+    word = re.sub(r"[\s.,?!~]+", "", text or "").lower()
+    topic = next((k for k, ws in TOPIC_KEYWORDS.items() if word in ws), None)
+    if not topic or not os.path.exists(QUESTION_DB_FILE): return []
+    con = sqlite3.connect(QUESTION_DB_FILE)
+    try:
+        col = {"en": "question_en", "mn": "question_mn"}.get(g.lang)   # 번역이 없으면 한국어 질문 사용
+        shown = f"COALESCE(NULLIF({col}, ''), question)" if col else "question"
+        rows = con.execute(f"SELECT {shown}, MAX(count) c FROM faq_questions WHERE topic=? GROUP BY subtype ORDER BY c DESC LIMIT ?",
+                           (topic, SUGGEST_COUNT)).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        con.close()
+    return [r[0] for r in rows]
+
+LANG_NAME = {"ko": "Korean", "en": "English", "mn": "Mongolian"}
+
+def warehouse_context():
+    """AI에게 알려 줄 현재 창고 상황 (재고·소진 예상·신청 가능량)"""
+    lines = []
+    for w in WAREHOUSES:
+        p = predict(w); a = availability(w, p)
+        lines.append(f"- {w['name']['en']} (id {w['id']}): stock {p['cur_pct']}% (~{p['cur_ton']}t of {w['capacity_ton']}t), "
+                     f"daily use {p['per_day']}%, runs out {p['deplete_date']}, status {p['level']}, "
+                     f"pending requests {a['pend']}t, available to request {a['avail']}t, "
+                     f"requests {'open' if a['truck_possible'] else 'closed (stock below one truck)'}")
+    return "\n".join(lines)
+
+def ask_llm(text, history):
+    """Gemini API로 답변 생성. 키가 없거나 오류면 None → 호출한 쪽이 FAQ로 대체"""
+    key = os.environ.get("GEMINI_API_KEY")
+    if not key: return None
+    system = (
+        "You are the help assistant of HayLink Lite, an app for shared hay warehouses and relief-feed delivery "
+        "during Mongolian dzud (severe winter). Users are herders and soum officials, mostly non-technical. "
+        f"Always reply in {LANG_NAME[g.lang]}, in short, simple sentences. "
+        "Rules of the app: a truck carries 5 t; requests are accepted only if warehouse stock is at least one truck; "
+        "a request cannot exceed stock minus pending requests; delivery takes about 3 days; weather can delay delivery. "
+        "Use only the data below for stock questions; if you don't know, say so and suggest contacting the administrator.\n\n"
+        "Current warehouse data:\n" + warehouse_context()
+    )
+    msgs = [{"role": "user" if h["role"] == "user" else "model", "parts": [{"text": str(h["content"])[:1000]}]}
+            for h in history[-CHAT_MAX_TURNS:]
+            if isinstance(h, dict) and h.get("role") in ("user", "assistant") and h.get("content")]
+    while msgs and msgs[0]["role"] != "user": msgs.pop(0)
+    msgs.append({"role": "user", "parts": [{"text": text[:1000]}]})
+    body = json.dumps({"system_instruction": {"parts": [{"text": system}]}, "contents": msgs,
+                       "generationConfig": {"maxOutputTokens": 600}}).encode("utf-8")
+    req = urllib.request.Request(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+        data=body, headers={"Content-Type": "application/json", "x-goog-api-key": key})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as res:
+            parts = json.loads(res.read())["candidates"][0]["content"]["parts"]
+        return "".join(p.get("text", "") for p in parts).strip() or None
+    except Exception as e:
+        print("Gemini API error:", e)
+        return None
+
 # ═══════════════════ 화면 (모바일 UI) ═══════════════════
 # 템플릿 이름에 .html 을 붙여야 Jinja 자동 이스케이프가 켜짐 (v0.2는 꺼져 있어 XSS 가능했음)
 BASE = """<!doctype html><html lang="{{ lang }}"><head><meta charset="utf-8">
@@ -629,21 +696,44 @@ PIN = """{% extends "base.html" %}{% block content %}
 
 CHAT = """{% extends "base.html" %}{% block content %}
 <h1>{{ t('chat_title') }}<span class="sub">{{ t('chat_sub') }}</span></h1>
+<style>
+/* 입력창은 하단 메뉴 바로 위에 고정, 대화만 스크롤 (카카오톡 방식) */
+.chatform{position:fixed;left:50%;transform:translateX(-50%);width:100%;max-width:480px;background:#f4f6f3;border-top:1px solid #e0e4de;padding:8px 14px;z-index:9}
+#chatspace{height:76px} footer{display:none}
+.chips{display:flex;flex-direction:column;gap:6px;align-self:flex-start;max-width:90%}
+.chip{width:auto;margin:0;min-height:0;padding:9px 14px;text-align:left;background:#fff;color:#2e5d34;border:1.5px solid #2e5d34;border-radius:16px;font-size:.9rem;font-weight:600}
+</style>
 <div class="card"><div class="chatlog" id="log"><div class="bubble bot">{{ t('chat_hello') }}</div></div></div>
+<div id="chatspace"></div>
 <form class="chatform" id="chatform">
  <input id="q" placeholder="{{ t('chat_ph') }}" autocomplete="off" required>
  <button type="submit">{{ t('chat_send') }}</button></form>
 <script>
 const log = document.getElementById('log'), form = document.getElementById('chatform'), q = document.getElementById('q');
-function add(cls, text){ const d = document.createElement('div'); d.className = 'bubble ' + cls; d.textContent = text; log.appendChild(d); d.scrollIntoView({block:'end'}); }
-form.addEventListener('submit', async function(e){
+const chatHistory = [];
+function layout(){ const tabs = document.querySelector('.tabs'); form.style.bottom = tabs.offsetHeight + 'px'; document.getElementById('chatspace').style.height = (form.offsetHeight + 12) + 'px'; }
+function toBottom(){ window.scrollTo({top: document.documentElement.scrollHeight, behavior: 'smooth'}); }
+window.addEventListener('load', layout); window.addEventListener('resize', layout);
+function add(cls, text){ const d = document.createElement('div'); d.className = 'bubble ' + cls; d.textContent = text; log.appendChild(d); toBottom(); }
+function addChips(list){
+  const box = document.createElement('div'); box.className = 'chips';
+  list.forEach(function(s){ const b = document.createElement('button'); b.type = 'button'; b.className = 'chip'; b.textContent = s;
+    b.addEventListener('click', function(){ box.remove(); send(s); }); box.appendChild(b); });
+  log.appendChild(box); toBottom();
+}
+async function send(text){
+  add('me', text);
+  try {
+    const res = await fetch('/api/chat', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text: text, history: chatHistory})});
+    const data = await res.json(); add('bot', data.answer);
+    if (data.suggestions) { addChips(data.suggestions); return; }
+    chatHistory.push({role:'user', content:text}, {role:'assistant', content:data.answer});
+  } catch(err) { add('bot', '...'); }
+}
+form.addEventListener('submit', function(e){
   e.preventDefault();
   const text = q.value.trim(); if(!text) return;
-  add('me', text); q.value = '';
-  try {
-    const res = await fetch('/api/chat', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text: text})});
-    const data = await res.json(); add('bot', data.answer);
-  } catch(err) { add('bot', '...'); }
+  q.value = ''; send(text);
 });
 </script>
 {% endblock %}"""
@@ -773,7 +863,12 @@ def chat():
 @app.route("/api/chat", methods=["POST"])
 def api_chat():
     data = request.get_json(silent=True) or request.form
-    return jsonify({"answer": answer_faq(data.get("text", ""))})
+    text = (data.get("text", "") or "").strip()
+    if not text: return jsonify({"answer": t("chat_fallback")})
+    suggestions = suggest_questions(text)
+    if suggestions: return jsonify({"answer": t("chat_pick"), "suggestions": suggestions})
+    history = data.get("history", []) if request.is_json else []
+    return jsonify({"answer": ask_llm(text, history if isinstance(history, list) else []) or answer_faq(text)})
 
 @app.route("/api/warehouses")
 def api_warehouses():
