@@ -6,6 +6,9 @@ data_extracted_dialog/
 # 임시·자동 생성 파일
 __pycache__/
 haylink.db
+# 운영 DB(이름·전화번호 등 개인정보가 들어감)와 DB 백업
+haylink_live.db
+haylink_backup_*.db
 
 # 백업·옛 버전·키 메모
 Mongolian_app_backup_*.py

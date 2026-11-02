@@ -3,7 +3,8 @@
 #  모바일 UI + 3개 언어 (ko / en / mn)
 #  실행: python Mongolian_app.py  →  브라우저 http://127.0.0.1:5000   (폰: http://노트북IP:5000)
 #  필요: pip install flask
-#  선택: 환경변수 HAYLINK_ADMIN_PIN=1234  → 관리자 화면·데모 초기화·대리 신청에 PIN 요구 (미설정 시 열림)
+#  선택: 환경변수 HAYLINK_MODE=live  → 운영 모드 (가짜 데이터·시연 버튼 없음, DB 파일도 haylink_live.db 로 분리). 기본은 demo
+#  선택: 환경변수 HAYLINK_ADMIN_PIN=1234 → 관리자 화면·데모 초기화·대리 신청에 PIN 요구 (미설정 시 열림)
 #
 #  v0.3 변경점
 #   - [핵심] 재고 < 트럭 1대(5t) 창고는 신청·배송 모두 차단 (재보충 전까지)
@@ -12,15 +13,16 @@
 #   - 잔량 0% 예측 버그, 시연 반출 ×3 버그, 템플릿 자동 이스케이프(XSS) 수정
 #   - 기온 캐시 TTL, 입력 검증, 관리자 PIN, 데모 시드 고정
 # =====================================================================
-from flask import Flask, request, jsonify, render_template, redirect, g
+from flask import Flask, request, jsonify, render_template, redirect, g, Response
 from jinja2 import DictLoader
 from urllib.parse import quote, urlparse
 from functools import wraps
-import sqlite3, datetime, random, json, urllib.request, os, re
+import sqlite3, datetime, random, json, urllib.request, os, re, csv, io
 
 # ─────────────── 설정 ───────────────
-DB_FILE          = "haylink.db"
-DEMO_MODE        = True          # 센서 없이 14일치 가짜 데이터 자동 생성
+APP_MODE         = os.environ.get("HAYLINK_MODE", "demo").strip().lower()   # demo: 시연(가짜 데이터·시연 버튼) | live: 운영(실제 데이터만)
+DEMO_MODE        = APP_MODE != "live"
+DB_FILE          = "haylink.db" if DEMO_MODE else "haylink_live.db"        # 시연 DB와 운영 DB 파일을 분리해 섞이지 않게 함
 TRUCK_CAPACITY_T = 5.0           # 트럭 1대 분량(톤)
 LEAD_DAYS        = 3             # 재보충 소요일
 HAY_BALE_TON     = 0.35          # 시연용 건초 1묶음
@@ -33,7 +35,16 @@ GEMINI_TIMEOUT_S = 12            # 모델 하나당 최대 대기 시간(초). �
 CHAT_MAX_TURNS   = 10            # AI에게 함께 보내는 이전 대화 최대 개수
 QUESTION_DB_FILE = "questions.db"   # import_questions.py 가 만드는 자주 묻는 질문 DB (데모 초기화에 지워지지 않도록 따로 둠)
 SUGGEST_COUNT    = 6                # 주제 단어만 입력했을 때 보여 줄 질문 버튼 수
-TOPIC_KEYWORDS   = {"배송": ("배송", "delivery", "shipping", "хүргэлт")}   # 이 단어만 입력하면 질문 버튼 표시
+TOPIC_KEYWORDS   = {"배송": ("배송", "delivery", "shipping", "хүргэлт"),     # 이 단어만 입력하면 질문 버튼 표시
+                    "재고": ("재고", "stock", "нөөц"),
+                    "입고": ("입고", "재입고", "재보충", "restock", "restocking", "нөхөх"),
+                    "신청": ("신청", "request", "order", "хүсэлт", "захиалга")}
+WEATHER_TTL_S    = 1800          # 현재 날씨 캐시 유효시간(초)
+FORECAST_HORIZON_D   = 60        # 농가 주문 기반 매진 예측이 내다보는 기간(일)
+MIN_ORDERS_FOR_CYCLE = 3         # 농가의 주문 주기를 계산하는 데 필요한 최소 주문 기록 수
+BASE_FARE_MNT    = 80000        # 기본 운임(MNT) — 추정치, 공식 요금 아님
+PER_KM_FARE_MNT  = 2500          # km당 운임(MNT) — 추정치, 공식 요금 아님
+BALES_PER_TON    = 40            # 25kg 묶음 40개 = 1톤
 LANGS            = ("ko", "en", "mn")
 DEFAULT_LANG     = "ko"
 SAFE_BACK        = {"/order", "/admin"}
@@ -70,7 +81,9 @@ T = {
  "nav_chat":     {"ko": "챗봇", "en": "Chatbot", "mn": "Чатбот"},
  "chat_title":   {"ko": "무엇이든 물어보세요", "en": "Ask us anything", "mn": "Юу ч асууж болно"},
  "chat_sub":     {"ko": "자주 묻는 질문에 바로 답해 드려요", "en": "Instant answers to common questions", "mn": "Түгээмэл асуултад шууд хариулна"},
- "chat_hello":   {"ko": "안녕하세요! 궁금한 점을 입력해 주세요. 예) 배송이 언제 오나요?", "en": "Hello! Type your question. e.g. When will my delivery arrive?", "mn": "Сайн байна уу! Асуултаа бичнэ үү. жишээ нь: Хүргэлт хэзээ ирэх вэ?"},
+ "chat_hello":   {"ko": "안녕하세요! 궁금한 점을 입력해 주세요. 예) 배송이 언제 오나요?\n'배송', '재고', '입고', '신청'만 입력하면 자주 묻는 질문을 골라 볼 수 있어요.",
+                  "en": "Hello! Type your question. e.g. When will my delivery arrive?\nType just 'delivery', 'stock', 'restock' or 'request' to pick from common questions.",
+                  "mn": "Сайн байна уу! Асуултаа бичнэ үү. жишээ нь: Хүргэлт хэзээ ирэх вэ?\n'хүргэлт', 'нөөц', 'нөхөх', 'хүсэлт' гэж бичвэл түгээмэл асуултуудаас сонгож болно."},
  "chat_ph":      {"ko": "질문을 입력하세요", "en": "Type your question", "mn": "Асуултаа бичнэ үү"},
  "chat_send":    {"ko": "보내기", "en": "Send", "mn": "Илгээх"},
  "chat_pick":    {"ko": "많이 묻는 질문이에요. 궁금한 걸 골라 주세요 👇", "en": "These are frequently asked. Pick one 👇", "mn": "Түгээмэл асуултууд. Сонгоно уу 👇"},
@@ -89,9 +102,9 @@ T = {
  "sensor_off":   {"ko": "센서 12시간 이상 무응답", "en": "Sensor offline >12 h", "mn": "Мэдрэгч 12+ цаг хариугүй"},
  "refilled":     {"ko": "입고 감지 — 입고 이후 데이터로 예측", "en": "Refill detected — forecast uses post-refill data", "mn": "Нөөц нэмэгдсэн — дараах өгөгдлөөр таамагласан"},
  "about_title":  {"ko": "이 화면은?", "en": "About this screen", "mn": "Энэ дэлгэц юу вэ?"},
- "about_body":   {"ko": "각 창고 천장의 초음파 센서(ESP32)가 5분마다 건초 높이를 측정해 재고를 자동 기록합니다. 소진 예상일은 최근 7일 감소 속도(선형회귀)에 한파 예보 가중치를 적용해 계산하며, 입고가 감지되면 입고 이후 데이터만 사용합니다. 사료 신청은 창고 실제 재고 범위 안에서만 받습니다.",
-                  "en": "An ultrasonic sensor (ESP32) on each warehouse ceiling measures hay height every 5 minutes and records stock automatically. The depletion date is estimated from the 7-day decline rate (linear regression) weighted by the cold-weather forecast; after a refill only post-refill data is used. Feed requests are accepted only within the warehouse's actual stock.",
-                  "mn": "Агуулах бүрийн таазанд байрлуулсан хэт авианы мэдрэгч (ESP32) 5 минут тутамд өвсний өндрийг хэмжиж нөөцийг автоматаар бүртгэнэ. Дуусах хугацааг сүүлийн 7 хоногийн буурах хурд (шугаман регресс) дээр хүйтний урьдчилсан мэдээний жинг нэмж тооцоолно; нөөц нэмэгдсэн бол түүнээс хойшхи өгөгдлийг л ашиглана. Тэжээлийн хүсэлтийг агуулахын бодит нөөцийн хүрээнд л хүлээн авна."},
+ "about_body":   {"ko": "각 창고 천장의 초음파 센서(ESP32)가 5분마다 건초 높이를 측정해 재고를 자동 기록합니다. 소진 예상일은 최근 7일 감소 속도(선형회귀)에 한파 예보 가중치를 적용해 계산하며, 입고가 감지되면 입고 이후 데이터만 사용합니다. 사료 신청은 창고 실제 재고 범위 안에서만 받습니다. 또한 농가별 주문 습관(평균 주문량·주기)으로 앞으로의 주문을 예상해 매진일을 계산하고, 센서 추세와 비교해 더 이른 날짜를 보여 줍니다.",
+                  "en": "An ultrasonic sensor (ESP32) on each warehouse ceiling measures hay height every 5 minutes and records stock automatically. The depletion date is estimated from the 7-day decline rate (linear regression) weighted by the cold-weather forecast; after a refill only post-refill data is used. Feed requests are accepted only within the warehouse's actual stock. The app also predicts upcoming orders from each herder's ordering habits (average amount and cycle) and shows the earlier of that run-out date and the sensor-trend date.",
+                  "mn": "Агуулах бүрийн таазанд байрлуулсан хэт авианы мэдрэгч (ESP32) 5 минут тутамд өвсний өндрийг хэмжиж нөөцийг автоматаар бүртгэнэ. Дуусах хугацааг сүүлийн 7 хоногийн буурах хурд (шугаман регресс) дээр хүйтний урьдчилсан мэдээний жинг нэмж тооцоолно; нөөц нэмэгдсэн бол түүнээс хойшхи өгөгдлийг л ашиглана. Тэжээлийн хүсэлтийг агуулахын бодит нөөцийн хүрээнд л хүлээн авна. Мөн малчин бүрийн захиалгын зуршлаар (дундаж хэмжээ, давтамж) ирэх захиалгыг таамаглаж, мэдрэгчийн хандлагатай харьцуулан эрт дуусах огноог харуулна."},
  # 상세
  "back":         {"ko": "← 창고 목록", "en": "← All warehouses", "mn": "← Агуулахын жагсаалт"},
  "cur_stock":    {"ko": "현재 건초 잔량", "en": "Current hay stock", "mn": "Одоогийн өвсний нөөц"},
@@ -103,6 +116,26 @@ T = {
  "lead_note":    {"ko": "배송 {n}일 소요 가정", "en": "assuming {n}-day delivery", "mn": "хүргэлт {n} хоног гэж тооцсон"},
  "trend":        {"ko": "최근 7일 재고 추이", "en": "Stock trend (last 7 days)", "mn": "Сүүлийн 7 хоногийн нөөцийн хандлага"},
  "no_data":      {"ko": "데이터 부족", "en": "Not enough data", "mn": "Өгөгдөл хангалтгүй"},
+ # 농가 주문 기반 매진 예측
+ "src_orders":   {"ko": "농가 주문 기준", "en": "from herder orders", "mn": "малчдын захиалгаар"},
+ "src_sensor":   {"ko": "센서 추세 기준", "en": "from sensor trend", "mn": "мэдрэгчийн хандлагаар"},
+ "of_title":     {"ko": "농가 주문 기반 매진 예측", "en": "Stockout forecast from herder orders", "mn": "Малчдын захиалгад суурилсан дуусах таамаг"},
+ "of_nodata":    {"ko": "농가별 주문 기록이 아직 부족해서 예측할 수 없어요. (농가마다 주문 {n}회 이상 필요)", "en": "Not enough order history yet. (each herder needs {n}+ orders)", "mn": "Захиалгын түүх хангалтгүй байна. (малчин бүр {n}+ захиалгатай байх ёстой)"},
+ "of_today":     {"ko": "오늘 매진 예상", "en": "Expected to sell out today", "mn": "Өнөөдөр дуусна гэж таамаглаж байна"},
+ "of_stockout":  {"ko": "{d}일 뒤 매진 예상", "en": "Expected to sell out in {d} days", "mn": "{d} хоногийн дараа дуусна гэж таамаглаж байна"},
+ "of_none":      {"ko": "{n}일 안에는 매진 예상 없음", "en": "No stockout expected within {n} days", "mn": "{n} хоногт дуусахгүй гэж таамаглаж байна"},
+ "of_cause":     {"ko": "매진 시점의 주문", "en": "Orders at that time", "mn": "Тэр үеийн захиалга"},
+ "of_block":     {"ko": "신청 차단 예상: {d} (재고가 트럭 1대 {n}t 미만이 됨)", "en": "Requests expected to close: {d} (stock drops below one truck, {n} t)", "mn": "Хүсэлт хаагдах төлөв: {d} (нөөц 1 машин, {n} тн-оос бага болно)"},
+ "of_block_now": {"ko": "이미 신청이 막혀 있어요 (재고가 트럭 1대 {n}t 미만)", "en": "Requests are already closed (stock below one truck, {n} t)", "mn": "Хүсэлт аль хэдийн хаалттай (нөөц 1 машин, {n} тн-оос бага)"},
+ "of_list":      {"ko": "예상 주문표", "en": "Expected orders", "mn": "Төлөвлөсөн захиалгууд"},
+ "of_left":      {"ko": "남는 재고 {x}t", "en": "{x} t left", "mn": "{x} тн үлдэнэ"},
+ "of_short":     {"ko": "재고 부족", "en": "short of stock", "mn": "нөөц дутна"},
+ "of_habits":    {"ko": "농가별 주문 습관", "en": "Herder ordering habits", "mn": "Малчдын захиалгын зуршил"},
+ "of_habit":     {"ko": "평균 {t}t · 약 {d}일마다 · 다음 {nx}", "en": "avg {t} t · every ~{d} days · next {nx}", "mn": "дундаж {t} тн · ~{d} хоног тутам · дараагийнх {nx}"},
+ "of_few":       {"ko": "주문 기록 {n}회 (주기를 알기엔 부족)", "en": "{n} orders so far (too few for a cycle)", "mn": "{n} захиалга (мөчлөг тооцоход хангалтгүй)"},
+ "of_pending":   {"ko": "대기 중 {t}t", "en": "pending {t} t", "mn": "хүлээгдэж буй {t} тн"},
+ "of_used":      {"ko": "농가 {n}곳 중 {m}곳의 주문 주기를 반영했어요", "en": "Used the ordering cycles of {m} of {n} herders", "mn": "{n} малчны {m}-ийн захиалгын мөчлөгийг тооцсон"},
+ "of_note":      {"ko": "과거 주문 습관으로 추정한 값이에요. 실제와 다를 수 있어요.", "en": "Estimated from past ordering habits; reality may differ.", "mn": "Өмнөх захиалгын зуршлаас таамагласан утга; бодит байдлаас ялгаатай байж болно."},
  "grp_this":     {"ko": "이 창고 공동배송 신청 현황", "en": "Shared-delivery requests for this warehouse", "mn": "Энэ агуулахын хамтарсан хүргэлтийн хүсэлт"},
  "truck1":       {"ko": "트럭 1대", "en": "1 truck", "mn": "1 ачааны машин"},
  "orders_n":     {"ko": "신청 {n}건", "en": "{n} requests", "mn": "{n} хүсэлт"},
@@ -177,6 +210,34 @@ T = {
  "lv_warn":      {"ko": "주의 — 재보충 준비", "en": "Caution — prepare restock", "mn": "Анхаар — нөөц нөхөхөд бэлтгэ"},
  "lv_danger":    {"ko": "위험 — 즉시 재보충", "en": "Critical — restock now", "mn": "Аюултай — нэн даруй нөхөх"},
  "lv_low":       {"ko": "소비 미미", "en": "Low usage", "mn": "Хэрэглээ бага"},
+ "lv_nodata":    {"ko": "측정값 없음", "en": "No reading yet", "mn": "Хэмжилт алга"},
+ # 신청 통계 (관리자)
+ "st_title":     {"ko": "신청 통계", "en": "Request statistics", "mn": "Хүсэлтийн статистик"},
+ "st_sub":       {"ko": "신청 시도(성공·실패)를 기간별로 모아 봐요", "en": "Request attempts (success and failure) by period", "mn": "Хүсэлтийн оролдлогыг (амжилттай/амжилтгүй) хугацаагаар"},
+ "st_open":      {"ko": "📈 신청 통계 보기", "en": "📈 Request statistics", "mn": "📈 Хүсэлтийн статистик"},
+ "st_back":      {"ko": "← 관리자", "en": "← Admin", "mn": "← Удирдлага"},
+ "st_day":       {"ko": "일별", "en": "Daily", "mn": "Өдрөөр"},
+ "st_week":      {"ko": "주별", "en": "Weekly", "mn": "7 хоногоор"},
+ "st_month":     {"ko": "월별", "en": "Monthly", "mn": "Сараар"},
+ "st_attempts":  {"ko": "신청 시도", "en": "Attempts", "mn": "Оролдлого"},
+ "st_rate":      {"ko": "성공률", "en": "Success rate", "mn": "Амжилтын хувь"},
+ "st_tons":      {"ko": "신청량(성공)", "en": "Requested (ok)", "mn": "Хүссэн (амжилттай)"},
+ "st_chart":     {"ko": "기간별 신청 시도", "en": "Attempts by period", "mn": "Хугацаагаар оролдлого"},
+ "st_ok":        {"ko": "성공", "en": "OK", "mn": "Амжилттай"},
+ "st_fail":      {"ko": "실패", "en": "Failed", "mn": "Амжилтгүй"},
+ "st_by_period": {"ko": "기간별", "en": "By period", "mn": "Хугацаагаар"},
+ "st_by_wh":     {"ko": "창고별", "en": "By warehouse", "mn": "Агуулахаар"},
+ "st_by_ch":     {"ko": "신청 경로별", "en": "By channel", "mn": "Сувгаар"},
+ "st_reasons":   {"ko": "실패 사유", "en": "Failure reasons", "mn": "Амжилтгүй болсон шалтгаан"},
+ "st_none":      {"ko": "아직 기록이 없어요", "en": "No records yet", "mn": "Одоогоор бүртгэл алга"},
+ "st_csv_req":   {"ko": "신청 시도 CSV 내려받기", "en": "Download request attempts (CSV)", "mn": "Хүсэлтийн оролдлого (CSV) татах"},
+ "st_csv_orders":{"ko": "신청 내역 CSV 내려받기", "en": "Download orders (CSV)", "mn": "Захиалгын жагсаалт (CSV) татах"},
+ "rs_bad_input": {"ko": "입력 오류", "en": "Invalid input", "mn": "Оролт буруу"},
+ "rs_wh_short":  {"ko": "재고 부족 (트럭 1대 미만)", "en": "Low stock (below one truck)", "mn": "Нөөц бага (1 машинаас доош)"},
+ "rs_over_stock":{"ko": "신청 가능량 초과", "en": "Over the available amount", "mn": "Боломжит хэмжээнээс их"},
+ "rs_sms_format":{"ko": "문자 형식 오류", "en": "SMS format error", "mn": "SMS формат буруу"},
+ "rs_sms_no_warehouse": {"ko": "문자: 창고를 못 찾음", "en": "SMS: warehouse not found", "mn": "SMS: агуулах олдсонгүй"},
+ "rs_sms_number":{"ko": "문자: 톤수 오류", "en": "SMS: invalid tons", "mn": "SMS: тонн буруу"},
  "cold_none":    {"ko": "기온 정보 없음 (기본값)", "en": "No temperature data (default)", "mn": "Температурын мэдээлэл алга (анхдагч)"},
  "cold_extreme": {"ko": "극한파 (−35℃ 이하) → 소비 1.5배", "en": "Extreme cold (≤ −35℃) → usage ×1.5", "mn": "Хэт хүйтэн (−35℃-ээс доош) → хэрэглээ 1.5 дахин"},
  "cold_severe":  {"ko": "강한 한파 (−25℃ 이하) → 소비 1.3배", "en": "Severe cold (≤ −25℃) → usage ×1.3", "mn": "Хүчтэй хүйтэн (−25℃-ээс доош) → хэрэглээ 1.3 дахин"},
@@ -222,7 +283,8 @@ def pick_lang():
 @app.context_processor
 def inject():
     return {"t": t, "lang": g.lang, "wh_name": wh_name, "demo": DEMO_MODE, "truck": TRUCK_CAPACITY_T,
-            "lead": LEAD_DAYS, "bale": HAY_BALE_TON, "order_min": ORDER_MIN_T, "warehouses": WAREHOUSES}
+            "lead": LEAD_DAYS, "bale": HAY_BALE_TON, "order_min": ORDER_MIN_T, "warehouses": WAREHOUSES,
+            "horizon": FORECAST_HORIZON_D, "min_orders": MIN_ORDERS_FOR_CYCLE}
 
 def msg_url(path, key, kind="ok", **kw):
     return f"{path}?msg={quote(t(key, **kw))}" + ("&kind=err" if kind == "err" else "")
@@ -268,28 +330,109 @@ def init_db():
     CREATE TABLE IF NOT EXISTS deliveries(id INTEGER PRIMARY KEY AUTOINCREMENT, warehouse_id TEXT, total_tons REAL, n_orders INTEGER, ts TEXT);
     CREATE INDEX IF NOT EXISTS idx_readings ON readings(warehouse_id, ts);
     CREATE INDEX IF NOT EXISTS idx_orders ON orders(warehouse_id, status);
+
+    -- 사료 기준 단가 (MNT). 조드 시기 시세를 참고한 추정치이며 공식·확정 가격이 아님
+    CREATE TABLE IF NOT EXISTS feed_items(
+        item_id INTEGER PRIMARY KEY AUTOINCREMENT, item_code TEXT UNIQUE NOT NULL,
+        name_ko TEXT NOT NULL, name_mn TEXT NOT NULL, name_en TEXT NOT NULL,
+        unit TEXT NOT NULL,                      -- bale(25kg), bag(25kg), block(30kg)
+        normal_price_mnt INTEGER NOT NULL,       -- 가을 평시 가격
+        dzud_peak_price_mnt INTEGER NOT NULL,    -- 조드 피크 시세
+        subsidized_price_mnt INTEGER NOT NULL);  -- 정부·국제기구 구호 단가
+    INSERT OR IGNORE INTO feed_items (item_code, name_ko, name_mn, name_en, unit, normal_price_mnt, dzud_peak_price_mnt, subsidized_price_mnt) VALUES
+        ('HAY_BALE', '천연 건초 (25kg 묶음)', 'Байгалийн өвс (25кг боодол)', 'Natural Hay Bale (25kg)', 'bale', 6000, 18000, 9000),
+        ('WHEAT_BRAN', '밀기울 농축사료 (25kg 포대)', 'Хүчит тэжээл / Хивэг (25кг)', 'Wheat Bran Fodder (25kg)', 'bag', 10000, 32000, 15000),
+        ('MINERAL_BLOCK', '미네랄 블록 (30kg)', 'Эрдэс долооц (30кг)', 'Mineral Lick Block (30kg)', 'block', 15000, 35000, 18000);
+
+    -- 날씨 단계별 운송비 할증 배율. min_temp: 이 기온보다 따뜻해야 해당 단계, max_snow_cm: 적설이 이보다 적어야 해당 단계
+    CREATE TABLE IF NOT EXISTS weather_delivery_rates(
+        rate_id INTEGER PRIMARY KEY AUTOINCREMENT, condition_code TEXT UNIQUE NOT NULL, condition_name_ko TEXT NOT NULL,
+        min_temp REAL, max_snow_cm REAL, cost_multiplier REAL NOT NULL, description TEXT);
+    INSERT OR IGNORE INTO weather_delivery_rates (condition_code, condition_name_ko, min_temp, max_snow_cm, cost_multiplier, description) VALUES
+        ('NORMAL', '정상 운송', -15.0, 5.0, 1.0, '평시 초원 도로 운행 가능'),
+        ('WARNING', '조드 주의 (한파/결빙)', -25.0, 10.0, 1.3, '영하 15~25도 한파, 디젤 결빙 위험 및 원거리 60~70% 운임 상승 반영'),
+        ('CRITICAL', '조드 경보 (폭설/고립)', -35.0, 15.0, 1.8, '적설량 10cm 이상, 4WD 특수 트럭 투입 및 도로 통제'),
+        ('EMERGENCY', '조드 비상재난 (도로 전면통제)', -50.0, 999.0, 2.5, '제설차량 동반 및 비상 수송 단계');
+
+    -- 신청 시도 기록: 성공·실패 모두. reason = ok / bad_input / wh_short / over_stock / sms_format / sms_no_warehouse / sms_number
+    CREATE TABLE IF NOT EXISTS request_log(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, warehouse_id TEXT, herder TEXT, phone TEXT, tons REAL,
+        channel TEXT, ok INTEGER NOT NULL, reason TEXT, stock_t REAL, avail_t REAL, pending_t REAL, lang TEXT, raw TEXT);
+    CREATE INDEX IF NOT EXISTS idx_request_log ON request_log(ts);
     """)
     con.commit()
     if DEMO_MODE and cur.execute("SELECT COUNT(*) FROM readings").fetchone()[0] == 0:
         seed_demo(cur); con.commit()
     con.close()
 
+# 시연 시나리오: 창고별 현재 재고(%)와 농가 목록. 날짜는 초기화한 시점 기준으로 만들어져 언제 초기화해도 같은 상황이 재현됨.
+# 농가 = (이름, 전화, 1회 주문량 t, 주문 주기 일, 다음 주문까지 남은 일, 지금 대기 중인 신청량 t, 신청 경로)
+DEMO_SCENARIOS = {
+    "zuunmod_01": {"stock_pct": 30, "herders": [          # 위험: 대기 신청 + Bold·Tsetseg 주문이 겹쳐 이틀 뒤 매진
+        ("Batbayar", "9911-0001", 1.5, 9, 0, 1.5, "app"), ("Oyunaa", "9911-0002", 2.0, 11, 0, 2.0, "sms"),
+        ("Bold", "9911-0004", 4.0, 12, 1, 0, "app"), ("Tsetseg", "9911-0005", 5.0, 14, 2, 0, "proxy"),
+        ("Munkh", "9911-0006", 1.5, 8, 3, 0, "app"), ("Naran", "9911-0007", 2.0, 10, 4, 0, "sms"),
+        ("Sarnai", "9911-0008", 1.0, 7, 5, 0, "app"), ("Enkh", "9911-0009", 2.5, 15, 6, 0, "proxy")]},
+    "altanbulag_01": {"stock_pct": 40, "herders": [       # 주의: 엿새쯤 뒤 매진
+        ("Ganbold", "9911-0020", 6.0, 15, 2, 0, "app"), ("Otgon", "9911-0021", 4.0, 12, 4, 0, "proxy"),
+        ("Bayar", "9911-0022", 3.0, 10, 5, 0, "sms"), ("Saran", "9911-0023", 2.0, 8, 1, 0, "app"),
+        ("Temuulen", "9911-0024", 1.5, 7, 3, 0, "app"), ("Altan", "9911-0025", 2.5, 9, 6, 0, "sms")]},
+    "bayan_01": {"stock_pct": 70, "herders": [            # 안정: 한 달 넘게 여유
+        ("Dorj", "9911-0003", 1.0, 12, 0, 1.0, "proxy"), ("Khulan", "9911-0010", 1.5, 14, 5, 0, "app"),
+        ("Erdene", "9911-0011", 1.0, 10, 7, 0, "sms"), ("Gerel", "9911-0012", 2.0, 20, 9, 0, "app"),
+        ("Lkhagva", "9911-0013", 1.0, 15, 11, 0, "proxy")]},
+    "sergelen_01": {"stock_pct": 4, "herders": [          # 이미 부족: 재고가 트럭 1대 미만이라 신청 차단, 오늘 주문도 못 채움
+        ("Zorig", "9911-0030", 1.5, 10, 0, 0, "app"), ("Narantuya", "9911-0031", 1.0, 8, 1, 0, "sms"),
+        ("Bat-Erdene", "9911-0032", 2.0, 12, 2, 0, "proxy"), ("Solongo", "9911-0033", 1.0, 9, 3, 0, "app"),
+        ("Tumur", "9911-0034", 1.5, 14, 5, 0, "app")]},
+}
+
 def seed_demo(cur):
-    """14일치 6시간 간격 가짜 측정값. 시드 고정 → 시연마다 같은 상황 재현.
-       세르겔렌·바양은 재고가 거의 바닥 → '재고 부족 시 신청 차단' 시연용."""
+    """시연용 가짜 데이터 (시드 고정). 창고마다 다른 상황으로 '농가 주문 기반 매진 예측'을 보여 줌:
+       준모드=곧 매진(위험), 알탄불락=며칠 뒤 매진(주의), 바양=여유(안정), 세르겔렌=이미 재고 부족(신청 차단).
+       ① 농가별 과거 주문 기록 8회 ② 그 소비 속도에 맞춰 줄어든 14일치 재고 측정값(6시간 간격) ③ 지금 대기 중인 신청"""
     random.seed(42)
-    now = datetime.datetime.now()
-    profile = {"zuunmod_01": (88, 2.2), "bayan_01": (70, 4.5), "altanbulag_01": (95, 1.4), "sergelen_01": (55, 3.8)}
+    now = datetime.datetime.now(); today = now.date()
+
+    def seed_log(ts, wid, herder, phone, tons, channel, ok, reason, raw=None):     # 신청 시도 기록 (통계 화면 시연용)
+        cur.execute("INSERT INTO request_log(ts, warehouse_id, herder, phone, tons, channel, ok, reason, lang, raw) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (ts, wid, herder, phone, tons, channel, 1 if ok else 0, reason, "ko", raw))
+
     for w in WAREHOUSES:
-        start, per_day = profile[w["id"]]
+        sc = DEMO_SCENARIOS[w["id"]]
+        per_day = sum(h[2] / h[3] for h in sc["herders"]) / w["capacity_ton"] * 100   # 농가 주문 속도를 재고 감소율(%/일)로
         for step in range(14 * 4):
-            ts = now - datetime.timedelta(hours=(14 * 4 - step) * 6)
-            pct = max(2, start - per_day * (step / 4) + random.uniform(-1.5, 1.5))
+            age_days = (14 * 4 - 1 - step) / 4                                      # 마지막 측정값 = 지금
+            noise = 0.0 if age_days == 0 else random.uniform(-0.8, 0.8)
+            pct = max(2, sc["stock_pct"] + per_day * age_days + noise)
+            ts = now - datetime.timedelta(days=age_days)
             cur.execute("INSERT INTO readings VALUES(NULL,?,?,?,?)",
                         (w["id"], round(pct_to_distance(w, pct), 1), round(pct, 1), ts.isoformat(timespec="seconds")))
-    for o in [("zuunmod_01", "Batbayar", "9911-0001", 1.5, "app"), ("zuunmod_01", "Oyunaa", "9911-0002", 2.0, "sms"),
-              ("bayan_01", "Dorj", "9911-0003", 1.0, "proxy")]:
-        cur.execute("INSERT INTO orders VALUES(NULL,?,?,?,?,?,?,?)", (*o, "pending", now.isoformat(timespec="seconds")))
+        for name, phone, tons, interval, due_in, pending, channel in sc["herders"]:
+            # 마지막으로 받아 간 날: 대기 신청이 있으면 한 주기 전, 없으면 '다음 주문일 - 주기'
+            d = today - datetime.timedelta(days=interval) if pending else today + datetime.timedelta(days=due_in - interval)
+            gaps = [1, -1, 0, 0, 0, 0]; random.shuffle(gaps)                      # 합이 0 → 평균 주기가 정확히 interval
+            for k in range(8):
+                qty = max(0.5, round(tons * random.uniform(0.85, 1.15), 1))
+                order_ts = datetime.datetime.combine(d, datetime.time(9, 0)).isoformat(timespec="seconds")
+                cur.execute("INSERT INTO orders VALUES(NULL,?,?,?,?,?,?,?)", (w["id"], name, phone, qty, channel, "dispatched", order_ts))
+                seed_log(order_ts, w["id"], name, phone, qty, channel, True, "ok")
+                d -= datetime.timedelta(days=interval + (gaps[k] if k < len(gaps) else 0))
+            if pending:
+                cur.execute("INSERT INTO orders VALUES(NULL,?,?,?,?,?,?,?)",
+                            (w["id"], name, phone, pending, channel, "pending", now.isoformat(timespec="seconds")))
+                seed_log(now.isoformat(timespec="seconds"), w["id"], name, phone, pending, channel, True, "ok")
+    # 실패한 신청 시도: 창고 상황에 맞는 사유 (세르겔렌은 재고 부족으로 막힌 시도가 많음)
+    fail_plan = {"zuunmod_01": [("over_stock", 6), ("bad_input", 3)], "altanbulag_01": [("over_stock", 4), ("bad_input", 2)],
+                 "bayan_01": [("bad_input", 3)], "sergelen_01": [("wh_short", 14), ("over_stock", 2)]}
+    for w in WAREHOUSES:
+        names = [h[0] for h in DEMO_SCENARIOS[w["id"]]["herders"]]
+        for reason, n in fail_plan[w["id"]]:
+            for _ in range(n):
+                ts = (now - datetime.timedelta(days=random.uniform(0, 45))).isoformat(timespec="seconds")
+                seed_log(ts, w["id"], random.choice(names), "", round(random.uniform(0.5, 6.0), 1), random.choice(["app", "app", "sms", "proxy"]), False, reason)
+    for _ in range(4):
+        seed_log((now - datetime.timedelta(days=random.uniform(0, 45))).isoformat(timespec="seconds"), None, None, "", None, "sms", False, "sms_format", raw="haylink 2 Bold")
 
 # ═══════════════════ 계산 ═══════════════════
 def distance_to_pct(w, d):
@@ -341,12 +484,92 @@ def fetch_min_temp(lat, lon):
         val = None
     _temp_cache[key] = (val, now); return val
 
+_weather_cache = {}   # (lat,lon) → (value, fetched_at)
+def fetch_current_weather(lat, lon):
+    """Open-Meteo 에서 현재 기온(℃)·적설 깊이(cm)를 가져옴. 모델 계산값이라 실제 초원과 차이 가능.
+       실패하면 None (실패도 5분간 기억해서 서버가 느려지지 않게 함)"""
+    key = (round(lat, 2), round(lon, 2)); now = datetime.datetime.now()
+    hit = _weather_cache.get(key)
+    if hit and (now - hit[1]).total_seconds() < (WEATHER_TTL_S if hit[0] else 300): return hit[0]
+    url = (f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
+           f"&current=temperature_2m,snow_depth&timezone=Asia%2FUlaanbaatar")
+    try:
+        with urllib.request.urlopen(url, timeout=2) as res:
+            cur = json.loads(res.read())["current"]
+        val = {"temp_c": round(cur["temperature_2m"], 1), "snow_cm": round((cur.get("snow_depth") or 0) * 100, 1), "time": cur["time"]}
+    except Exception:
+        val = None
+    _weather_cache[key] = (val, now); return val
+
 def cold_factor(tm):
     if tm is None:  return 1.0, "cold_none"
     if tm <= -35:   return 1.5, "cold_extreme"
     if tm <= -25:   return 1.3, "cold_severe"
     if tm <= -15:   return 1.15, "cold_mild"
     return 1.0, "cold_normal"
+
+def herder_cycles(wid):
+    """농가별 주문 습관. 농가 구분은 전화번호(없으면 이름). 주문 기록이 MIN_ORDERS_FOR_CYCLE 회 이상이면
+       평균 주문량(최근 4회)·평균 주기(최근 6간격, 일)·다음 예상 주문일을 계산"""
+    today = datetime.date.today(); groups = {}
+    for r in q("SELECT herder, phone, tons, status, ts FROM orders WHERE warehouse_id=? ORDER BY ts", (wid,)):
+        key = (r["phone"] or "").strip() or r["herder"].strip().lower()
+        g = groups.setdefault(key, {"name": r["herder"].strip(), "orders": []})
+        g["orders"].append((datetime.datetime.fromisoformat(r["ts"]).date(), float(r["tons"]), r["status"]))
+    out = []
+    for g in groups.values():
+        orders = g["orders"]; dates = [o[0] for o in orders]
+        pending = round(sum(o[1] for o in orders if o[2] == "pending"), 1)
+        gaps = [(b - a).days for a, b in zip(dates, dates[1:]) if (b - a).days > 0][-6:]
+        h = {"name": g["name"], "n_orders": len(orders), "pending_t": pending, "avg_t": None, "interval_d": None, "next_date": None}
+        if len(orders) >= MIN_ORDERS_FOR_CYCLE and gaps:
+            h["interval_d"] = max(1, round(sum(gaps) / len(gaps)))
+            h["avg_t"] = round(sum(o[1] for o in orders[-4:]) / len(orders[-4:]), 1)
+            # 대기 신청이 있으면 그게 이번 주문 → 다음은 한 주기 뒤. 예정일이 지났으면 '오늘'로 봄
+            step = datetime.timedelta(days=h["interval_d"])
+            h["next_date"] = today + step if pending else max(today, dates[-1] + step)
+        out.append(h)
+    return out
+
+def order_forecast(w, stock_t):
+    """[핵심] 농가별 주문 습관으로 앞으로 FORECAST_HORIZON_D 일의 예상 주문표를 만들고,
+       현재 재고에서 날짜순으로 빼 가며 '재고 0 도달(매진)'과 '트럭 1대 미만(신청 차단)' 시점을 찾음.
+       대기 중인 신청은 오늘 나갈 양으로 봄. 날짜는 화면용 'MM/DD' 문자열로 반환"""
+    today = datetime.date.today(); end = today + datetime.timedelta(days=FORECAST_HORIZON_D)
+    herders = herder_cycles(w["id"]); events = []
+    for h in herders:
+        if h["pending_t"]: events.append((today, h["name"], h["pending_t"]))
+        if h["interval_d"]:
+            d = h["next_date"]
+            while d <= end:
+                events.append((d, h["name"], h["avg_t"])); d += datetime.timedelta(days=h["interval_d"])
+    events.sort(key=lambda e: (e[0], e[1]))
+    left = stock_t; stockout = None; timeline = []
+    blocked_now = stock_t < TRUCK_CAPACITY_T
+    block = today if blocked_now else None
+    for d, name, tons in events:
+        if stockout is not None and d > stockout: break
+        left -= tons
+        if block is None and left < TRUCK_CAPACITY_T: block = d
+        if stockout is None and left <= 1e-9: stockout = d
+        timeline.append({"d": d, "name": name, "tons": tons, "left": round(max(left, 0.0), 1), "short": left <= 1e-9})
+    fmt = lambda d: d.strftime("%m/%d") if d else None
+    herders.sort(key=lambda h: (h["next_date"] is None, h["next_date"] or today, h["name"]))
+    return {
+        "n_herders": len(herders), "n_used": sum(1 for h in herders if h["interval_d"]),
+        "has_data": any(h["interval_d"] for h in herders),          # 주기를 아는 농가가 한 곳도 없으면 예측 근거 없음
+        "stockout_date": fmt(stockout), "days": (stockout - today).days if stockout else None,
+        "cause": [e["name"] for e in timeline if e["d"] == stockout],
+        "block_date": fmt(block), "blocked_now": blocked_now,
+        "timeline": [{"date": fmt(e["d"]), "name": e["name"], "tons": e["tons"], "left": e["left"], "short": e["short"]} for e in timeline[:10]],
+        "herders": [{"name": h["name"], "avg_t": h["avg_t"], "interval_d": h["interval_d"], "next": fmt(h["next_date"]) or "-",
+                     "n_orders": h["n_orders"], "pending_t": h["pending_t"]} for h in herders],
+    }
+
+def empty_forecast():
+    """측정값이 없어 예측할 수 없을 때의 빈 결과 (order_forecast 와 같은 모양)"""
+    return {"n_herders": 0, "n_used": 0, "has_data": False, "stockout_date": None, "days": None, "cause": [],
+            "block_date": None, "blocked_now": False, "timeline": [], "herders": []}
 
 def predict(w):
     rows, refilled = rows_since_last_refill(readings_last_days(w["id"], 7))
@@ -363,12 +586,18 @@ def predict(w):
     days_base = cur_pct / per_day if per_day > 0.05 else None
     days_cold = days_base / factor if days_base is not None else None
     days_use = days_cold
+    source = "sensor" if days_use is not None else None
+    fc = order_forecast(w, cur_pct / 100 * w["capacity_ton"]) if last else empty_forecast()
+    if fc["days"] is not None and (days_use is None or fc["days"] < days_use):   # 센서 추세·농가 주문 중 빠른 날짜 하나만 사용
+        days_use, source = float(fc["days"]), "orders"
     if days_use is None:            level, level_key = "ok", "lv_low"
     elif days_use <= LEAD_DAYS:     level, level_key = "danger", "lv_danger"
     elif days_use <= LEAD_DAYS + 4: level, level_key = "warn", "lv_warn"
     else:                           level, level_key = "ok", "lv_ok"
     if cur_pct <= 5 and level != "danger":  # 잔량 자체가 바닥이면 소비 속도와 무관하게 위험
         level, level_key = "danger", "lv_danger"
+    if last is None:  # 센서 측정값이 아직 없음 (운영 시작 직후) → 재고 0% 위험으로 오해하지 않게
+        level, level_key = "ok", "lv_nodata"
     today = datetime.date.today(); has = days_use is not None
     return {
         "cur_pct": round(cur_pct, 1), "cur_ton": round(cur_pct / 100 * w["capacity_ton"], 1),
@@ -378,7 +607,7 @@ def predict(w):
         "days_use": round(days_use, 1) if has else None,
         "deplete_date": (today + datetime.timedelta(days=days_use)).strftime("%m/%d") if has else "-",
         "reorder_date": (today + datetime.timedelta(days=max(0, days_use - LEAD_DAYS))).strftime("%m/%d") if has else "-",
-        "level": level, "level_key": level_key,
+        "level": level, "level_key": level_key, "stockout_source": source, "order_fc": fc,
         "last_ts": last["ts"].replace("T", " ") if last else "-",
         "sensor_ok": bool(last) and (datetime.datetime.now() - datetime.datetime.fromisoformat(last["ts"])) < datetime.timedelta(hours=12),
     }
@@ -402,22 +631,139 @@ def availability(w, p=None):
             "truck_possible": truck_possible,
             "can_dispatch": truck_possible and pend >= TRUCK_CAPACITY_T and pend <= stock + 1e-9}
 
+def weather_level(temp_celsius, snow_depth_cm=None):
+    """기온·적설량으로 날씨 단계와 운송비 할증 배율을 구함 (기준은 weather_delivery_rates 표).
+       '기온이 min_temp 보다 높고 적설이 max_snow_cm 보다 적은' 첫 단계. 모두 넘으면 가장 높은 단계. 값이 None 이면 그 조건은 무시."""
+    rows = q("SELECT condition_code, min_temp, max_snow_cm, cost_multiplier FROM weather_delivery_rates ORDER BY cost_multiplier")
+    if not rows: return "NORMAL", 1.0
+    for r in rows:
+        if ((temp_celsius is None or r["min_temp"] is None or temp_celsius > r["min_temp"])
+                and (snow_depth_cm is None or r["max_snow_cm"] is None or snow_depth_cm < r["max_snow_cm"])):
+            return r["condition_code"], r["cost_multiplier"]
+    return rows[-1]["condition_code"], rows[-1]["cost_multiplier"]
+
+def delivery_weather(w, p=None):
+    """창고 지역의 배송 날씨 단계. 현재 기온·적설(실시간)을 우선 쓰고, 못 가져오면 7일 예보 최저기온으로 대체"""
+    cur = fetch_current_weather(w["lat"], w["lon"])
+    if cur:
+        cond, mult = weather_level(cur["temp_c"], cur["snow_cm"])
+        return {"condition": cond, "multiplier": mult, "temp_c": cur["temp_c"], "snow_cm": cur["snow_cm"], "source": "current"}
+    p = p or predict(w)
+    cond, mult = weather_level(p["temp_min"])
+    return {"condition": cond, "multiplier": mult, "temp_c": p["temp_min"], "snow_cm": None, "source": "forecast"}
+
+def calculate_delivery_cost(distance_km, temp_celsius, snow_depth_cm, herder_count=1):
+    """거리·기온·적설량·공동배송 가구 수로 배송비(MNT)와 가구당 분담금을 계산 (모두 추정치).
+       총액 = (기본 운임 + 거리 × km당 운임) × 날씨 할증 배율,  가구당 = 총액 ÷ 가구 수"""
+    condition, multiplier = weather_level(temp_celsius, snow_depth_cm)
+    raw_total_cost = (BASE_FARE_MNT + max(0.0, float(distance_km)) * PER_KM_FARE_MNT) * multiplier
+    per_herder_cost = raw_total_cost / max(1, int(herder_count))
+    return {
+        "condition": condition,
+        "multiplier": multiplier,
+        "total_delivery_cost_mnt": round(raw_total_cost),
+        "per_herder_cost_mnt": round(per_herder_cost),
+        "savings_per_herder_mnt": round(raw_total_cost - per_herder_cost),
+    }
+
+def log_request(ok, reason, wid=None, herder=None, phone=None, tons=None, channel=None, stock=None, avail=None, pend=None, raw=None):
+    """신청 시도(성공·실패 모두)를 request_log 에 기록. 기록이 실패해도 신청 처리는 막지 않음"""
+    try:
+        x("INSERT INTO request_log(ts, warehouse_id, herder, phone, tons, channel, ok, reason, stock_t, avail_t, pending_t, lang, raw) "
+          "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+          (now_iso(), (str(wid)[:40] if wid else None), (herder or None) and str(herder)[:60], (phone or None) and str(phone)[:30], tons,
+           channel, 1 if ok else 0, reason, stock, avail, pend, getattr(g, "lang", None), (raw or None) and str(raw)[:300]))
+    except Exception as e:
+        print("request_log error:", e)
+
 def try_add_order(wid, herder, phone, tons, channel):
-    """검증 후 신청 등록. (ok, msg_key, kwargs) 반환. 앱·SMS·대리 3채널이 모두 이 함수를 거침."""
+    """검증 후 신청 등록. (ok, msg_key, kwargs) 반환. 앱·SMS·대리 3채널이 모두 이 함수를 거침. 성공·실패 모두 request_log 에 남김."""
     w = WH_BY_ID.get(wid)
     herder = (herder or "").strip()[:60]
     phone = (phone or "").strip()[:30]
     try: tons = round(float(tons), 1)
     except (TypeError, ValueError): tons = 0.0
     if not w or not herder or tons < ORDER_MIN_T:
+        log_request(False, "bad_input", wid, herder, phone, tons, channel)
         return False, "msg_bad_input", {"m": ORDER_MIN_T}
     a = availability(w)
+    seen = {"stock": a["stock"], "avail": a["avail"], "pend": a["pend"]}
     if not a["truck_possible"]:
+        log_request(False, "wh_short", wid, herder, phone, tons, channel, **seen)
         return False, "msg_wh_short", {"wh": wh_name(wid), "stock": a["stock"], "n": TRUCK_CAPACITY_T, "avail": 0.0}
     if tons > a["avail"] + 1e-9:
+        log_request(False, "over_stock", wid, herder, phone, tons, channel, **seen)
         return False, "msg_over_stock", {"wh": wh_name(wid), "tons": tons, "avail": a["avail"], "stock": a["stock"], "pend": a["pend"]}
     x("INSERT INTO orders VALUES(NULL,?,?,?,?,?,?,?)", (wid, herder, phone, tons, channel, "pending", now_iso()))
+    log_request(True, "ok", wid, herder, phone, tons, channel, **seen)
     return True, "msg_order_ok", {"name": herder, "tons": tons, "wh": wh_name(wid), "avail": round(a["avail"] - tons, 1)}
+
+def request_stats(period="day"):
+    """신청 시도(request_log)를 일(30일)·주(12주)·월(12개월) 단위로 모아 시도·성공·실패·신청량(성공 건)과
+       창고별·경로별·실패 사유별 합계를 계산. 날짜 묶기는 파이썬에서 해서 DB 종류와 무관하게 동작"""
+    today = datetime.date.today()
+    if period == "week":
+        monday = today - datetime.timedelta(days=today.weekday())
+        keys = [(monday - datetime.timedelta(weeks=i)).isoformat() for i in range(11, -1, -1)]
+    elif period == "month":
+        keys = []
+        for i in range(11, -1, -1):
+            m = today.month - i; keys.append(f"{today.year + (m - 1) // 12:04d}-{(m - 1) % 12 + 1:02d}")
+    else:
+        period = "day"; keys = [(today - datetime.timedelta(days=i)).isoformat() for i in range(29, -1, -1)]
+
+    def bucket(ts):
+        if period == "month": return ts[:7]
+        if period == "day": return ts[:10]
+        d = datetime.date.fromisoformat(ts[:10]); return (d - datetime.timedelta(days=d.weekday())).isoformat()
+
+    def label(k):
+        return k if period == "month" else k[5:].replace("-", "/") + ("~" if period == "week" else "")
+
+    rows = q("SELECT ts, warehouse_id, tons, channel, ok, reason FROM request_log WHERE ts>=? ORDER BY ts",
+             (keys[0] + ("-01" if period == "month" else ""),))
+    new = lambda: {"attempts": 0, "ok": 0, "fail": 0, "tons": 0.0}
+    buckets = {k: {"label": label(k), **new()} for k in keys}; total = new()
+    by_wh, by_ch, reasons = {}, {}, {}
+    for r in rows:
+        b = buckets.get(bucket(r["ts"]))
+        if b is None: continue
+        ok = bool(r["ok"]); tons = float(r["tons"] or 0) if ok else 0.0
+        for acc in (b, total, by_wh.setdefault(r["warehouse_id"] or "-", new()), by_ch.setdefault(r["channel"] or "-", new())):
+            acc["attempts"] += 1; acc["ok" if ok else "fail"] += 1; acc["tons"] = round(acc["tons"] + tons, 1)
+        if not ok: reasons[r["reason"] or "-"] = reasons.get(r["reason"] or "-", 0) + 1
+    ch_label = {"app": "ch_app", "sms": "ch_sms", "proxy": "ch_proxy"}
+    return {
+        "period": period, "buckets": list(buckets.values()), "total": total,
+        "rate": round(total["ok"] / total["attempts"] * 100) if total["attempts"] else 0,
+        "by_wh": sorted(({"key": k, **v} for k, v in by_wh.items()), key=lambda r: -r["attempts"]),
+        "by_ch": sorted(({"key": k, "label_key": ch_label.get(k, k), **v} for k, v in by_ch.items()), key=lambda r: -r["attempts"]),
+        "reasons": sorted(({"key": k, "n": n} for k, n in reasons.items()), key=lambda r: -r["n"]),
+    }
+
+def svg_bars(buckets, width=440, height=160):
+    """기간별 신청 시도 막대 그래프 (초록=성공, 빨강=실패)"""
+    pad = 24; n = len(buckets); top = max(1, max(b["attempts"] for b in buckets))
+    slot = (width - 2 * pad) / n; bw = slot * 0.7; base = height - pad; scale = (height - 2 * pad) / top; bars = ""
+    for i, b in enumerate(buckets):
+        xx = pad + i * slot + (slot - bw) / 2; h_ok = b["ok"] * scale; h_fail = b["fail"] * scale
+        bars += f'<rect x="{xx:.1f}" y="{base - h_ok:.1f}" width="{bw:.1f}" height="{h_ok:.1f}" fill="#43a047"/>'
+        bars += f'<rect x="{xx:.1f}" y="{base - h_ok - h_fail:.1f}" width="{bw:.1f}" height="{h_fail:.1f}" fill="#e53935"/>'
+    return (f'<svg viewBox="0 0 {width} {height}" style="width:100%;display:block">'
+            f'<line x1="{pad}" y1="{base}" x2="{width - pad}" y2="{base}" stroke="#d5dad3"/>'
+            f'<text x="2" y="{pad - 8}" font-size="10" fill="#8a958c">{top}</text>{bars}'
+            f'<text x="{pad}" y="{height - 6}" font-size="10" fill="#8a958c">{buckets[0]["label"]}</text>'
+            f'<text x="{width - pad - 40}" y="{height - 6}" font-size="10" fill="#8a958c">{buckets[-1]["label"]}</text></svg>')
+
+def csv_safe(v):
+    """엑셀에서 열 때 '=' '+' '-' '@' 로 시작하는 글자가 수식으로 실행되지 않게 앞에 작은따옴표를 붙임"""
+    return "'" + v if isinstance(v, str) and v[:1] in ("=", "+", "-", "@") else v
+
+def csv_response(filename, header, rows):
+    buf = io.StringIO(); buf.write("﻿")        # 엑셀에서 한글이 깨지지 않게 BOM
+    wr = csv.writer(buf); wr.writerow(header)
+    for r in rows: wr.writerow([csv_safe(v) for v in r])
+    return Response(buf.getvalue(), mimetype="text/csv", headers={"Content-Disposition": f"attachment; filename={filename}"})
 
 def svg_chart(rows, width=440, height=180):
     if len(rows) < 2: return f"<p class='muted'>{t('no_data')}</p>"
@@ -435,13 +781,13 @@ def svg_chart(rows, width=440, height=180):
 
 def parse_sms(text):
     parts = (text or "").strip().split()
-    if len(parts) < 3 or parts[0].upper() != "HAY": return None, t("sms_fmt")
+    if len(parts) < 3 or parts[0].upper() != "HAY": return None, t("sms_fmt"), "sms_format"
     key = parts[1].lower()
     w = next((w for w in WAREHOUSES if key in w["id"].lower() or any(key in s.lower() for s in w["soum"].values())), None)
-    if not w: return None, t("sms_nowh", k=parts[1])
+    if not w: return None, t("sms_nowh", k=parts[1]), "sms_no_warehouse"
     try: tons = float(parts[2])
-    except ValueError: return None, t("sms_num")
-    return {"warehouse_id": w["id"], "tons": tons, "herder": " ".join(parts[3:]) or t("sms_herder")}, "OK"
+    except ValueError: return None, t("sms_num"), "sms_number"
+    return {"warehouse_id": w["id"], "tons": tons, "herder": " ".join(parts[3:]) or t("sms_herder")}, "OK", None
 
 def answer_faq(text):
     text = (text or "").lower()
@@ -460,7 +806,7 @@ def suggest_questions(text):
     try:
         col = {"en": "question_en", "mn": "question_mn"}.get(g.lang)   # 번역이 없으면 한국어 질문 사용
         shown = f"COALESCE(NULLIF({col}, ''), question)" if col else "question"
-        rows = con.execute(f"SELECT {shown}, MAX(count) c FROM faq_questions WHERE topic=? GROUP BY subtype ORDER BY c DESC LIMIT ?",
+        rows = con.execute(f"SELECT {shown} FROM faq_questions WHERE topic=? AND pick>0 ORDER BY pick LIMIT ?",
                            (topic, SUGGEST_COUNT)).fetchall()
     except sqlite3.Error:
         return []
@@ -475,10 +821,42 @@ def warehouse_context():
     lines = []
     for w in WAREHOUSES:
         p = predict(w); a = availability(w, p)
+        dw = delivery_weather(w, p)
+        weather_txt = (f"right now {dw['temp_c']} C, snow depth {dw['snow_cm']} cm - model estimate, may differ on the ground" if dw["source"] == "current"
+                       else f"forecast min temp {dw['temp_c'] if dw['temp_c'] is not None else 'unknown'} C, snow depth unknown")
+        of = p["order_fc"]
+        if of["stockout_date"]:
+            fc_txt = f"order-based forecast: stock runs out {of['stockout_date']} (in {of['days']} days) when orders from {', '.join(of['cause'])} come"
+        elif of["has_data"]:
+            fc_txt = f"order-based forecast: no stockout expected within {FORECAST_HORIZON_D} days"
+        else:
+            fc_txt = "order-based forecast: not enough order history"
+        if of["blocked_now"]: fc_txt += "; requests already closed (stock below one truck)"
+        elif of["block_date"]: fc_txt += f"; requests expected to close around {of['block_date']} (stock below one truck)"
+        upcoming = "; ".join(f"{e['date']} {e['name']} {e['tons']}t" for e in of["timeline"][:5])
+        if upcoming: fc_txt += f"; next expected orders: {upcoming}"
+        fc_txt += f"; based on {of['n_used']} of {of['n_herders']} herders' ordering cycles"
         lines.append(f"- {w['name']['en']} (id {w['id']}): stock {p['cur_pct']}% (~{p['cur_ton']}t of {w['capacity_ton']}t), "
                      f"daily use {p['per_day']}%, runs out {p['deplete_date']}, status {p['level']}, "
                      f"pending requests {a['pend']}t, available to request {a['avail']}t, "
-                     f"requests {'open' if a['truck_possible'] else 'closed (stock below one truck)'}")
+                     f"requests {'open' if a['truck_possible'] else 'closed (stock below one truck)'}, "
+                     f"delivery weather level {dw['condition']} (fee x{dw['multiplier']}; {weather_txt}), "
+                     f"displayed run-out date {p['deplete_date']} ({p['stockout_source'] or 'none'}-based), {fc_txt}")
+    return "\n".join(lines)
+
+def cost_context():
+    """AI에게 알려 줄 사료 가격·배송비 추정치 (조드 시세 기준 참고값, 공식·확정 가격 아님)"""
+    lines = []
+    for i in q("SELECT item_code, name_en, unit, normal_price_mnt, dzud_peak_price_mnt, subsidized_price_mnt FROM feed_items"):
+        lines.append(f"- {i['name_en']} per {i['unit']}: normal-season {i['normal_price_mnt']:,} MNT, dzud-peak market {i['dzud_peak_price_mnt']:,} MNT, "
+                     f"relief (subsidized) {i['subsidized_price_mnt']:,} MNT")
+        if i["item_code"] == "HAY_BALE":
+            lines.append(f"- Natural hay per ton (= {BALES_PER_TON} bales of 25 kg): normal-season about {i['normal_price_mnt'] * BALES_PER_TON:,} MNT, "
+                         f"dzud-peak market about {i['dzud_peak_price_mnt'] * BALES_PER_TON:,} MNT, relief about {i['subsidized_price_mnt'] * BALES_PER_TON:,} MNT")
+    lines.append(f"Delivery fee estimate = (base {BASE_FARE_MNT:,} MNT + {PER_KM_FARE_MNT:,} MNT per km) x weather multiplier; the truck fee is split among the households sharing the delivery.")
+    for r in q("SELECT condition_code, condition_name_ko, cost_multiplier FROM weather_delivery_rates ORDER BY cost_multiplier"):
+        total = round((BASE_FARE_MNT + 100 * PER_KM_FARE_MNT) * r["cost_multiplier"])
+        lines.append(f"  - weather level {r['condition_code']}: x{r['cost_multiplier']} -> for 100 km about {total:,} MNT per truck (about {round(total / 4):,} MNT each if 4 households share)")
     return "\n".join(lines)
 
 def ask_llm(text, history):
@@ -491,8 +869,26 @@ def ask_llm(text, history):
         f"Always reply in {LANG_NAME[g.lang]}, in short, simple sentences. "
         "Rules of the app: a truck carries 5 t; requests are accepted only if warehouse stock is at least one truck; "
         "a request cannot exceed stock minus pending requests; delivery takes about 3 days; weather can delay delivery. "
-        "Use only the data below for stock questions; if you don't know, say so and suggest contacting the administrator.\n\n"
-        "Current warehouse data:\n" + warehouse_context()
+        "A request can be made in 3 ways: in the app (Requests tab, minimum 0.5 t), by SMS in the format 'HAY warehouse tons name' "
+        "(works with 2G signal), or by the bagh leader / warehouse manager on behalf of a herder without signal. "
+        "Requests from one warehouse are delivered together once pending requests reach one truck (5 t). "
+        "Use only the data below for stock questions; if you don't know, say so and suggest contacting the administrator. "
+        "Each warehouse has a run-out forecast: the app learns each herder's usual order amount and cycle, predicts upcoming orders, "
+        "and subtracts them from the current stock; the displayed run-out date is the earlier of this order-based date and the sensor-trend date. "
+        "When asked when a warehouse will run out or sell out, give that date, name the herders whose expected orders cause it, "
+        "mention when requests are expected to close (stock below one truck), and say it is an estimate from past ordering habits. "
+        "For price or cost questions use only the estimates below. Always present them as rough estimates based on dzud-period market levels, never as official or fixed prices: "
+        "say 'about' and give the amount; explain that hay is priced at the dzud-peak market level and that relief (subsidized) supply may be cheaper; "
+        "that bad weather (severe cold, heavy snow, icy roads) makes delivery harder and can add an extra delivery fee (the weather multiplier), "
+        "and that the truck fee is divided among households sharing the delivery, so joining a shared delivery lowers each household's cost. "
+        "Explain this in a calm, reassuring tone, and say the final amount is confirmed by the administrator before delivery. "
+        "Each warehouse below has its current delivery weather level; when asked about weather or extra delivery fees, state the current level for the relevant warehouse(s) "
+        "and say that conditions can change before delivery (the weather figures are model estimates). "
+        "Never say for certain that hay or delivery is free or must be paid for; say it depends (relief supply may be cheaper or supported) and the administrator confirms. "
+        "For a 'free?' question, do not begin with 'yes' or 'no': begin with 'it depends'. "
+        "Write dzud as 조드 in Korean and as зуд in Mongolian. "
+        "Do not invent prices or distances that are not given below.\n\n"
+        "Current warehouse data:\n" + warehouse_context() + "\n\nPrice and delivery cost estimates (reference only):\n" + cost_context()
     )
     msgs = [{"role": "user" if h["role"] == "user" else "model", "parts": [{"text": str(h["content"])[:1000]}]}
             for h in history[-CHAT_MAX_TURNS:]
@@ -603,11 +999,30 @@ DETAIL = """{% extends "base.html" %}{% block content %}
  <div class="gauge"><div class="{{ p.level }}" style="width:{{ p.cur_pct }}%"></div></div>
  <div class="muted">{{ t('last_reading') }}: {{ p.last_ts }}</div></div>
 <div class="card"><div class="muted">{{ t('forecast') }}</div>
- <div style="display:flex;align-items:baseline;gap:10px"><span class="big">{{ p.deplete_date }}</span>
-  {% if p.days_base is not none %}<span class="muted">{{ t('base_days', a=p.days_base, b=p.days_cold) }}</span>{% endif %}</div>
+ <div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap"><span class="big">{{ p.deplete_date }}</span>
+  {% if p.stockout_source %}<span class="badge {{ p.level }}">{{ t('src_' ~ p.stockout_source) }}</span>{% endif %}</div>
+ {% if p.days_base is not none %}<div class="muted">{{ t('src_sensor') }}: {{ t('base_days', a=p.days_base, b=p.days_cold) }}</div>{% endif %}
  <div class="muted">🌡 {{ t('temp_min') }}: {{ p.temp_min if p.temp_min is not none else '?' }}℃ · {{ t(p.factor_key) }}</div>
  {% if p.refilled %}<div class="muted">📥 {{ t('refilled') }}</div>{% endif %}
  <div class="infobox">📦 {{ t('reorder') }}: <b>{{ p.reorder_date }}</b> <span class="muted">({{ t('lead_note', n=lead) }})</span></div></div>
+{% set f = p.order_fc %}
+<div class="card"><h2>🔮 {{ t('of_title') }}</h2>
+{% if not f.has_data %}<p class="muted" style="margin:0">{{ t('of_nodata', n=min_orders) }}</p>
+{% else %}
+ <div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap">
+ {% if f.stockout_date %}<span class="big">{{ f.stockout_date }}</span><span class="muted">{{ t('of_today') if f.days == 0 else t('of_stockout', d=f.days) }}</span>
+ {% else %}<b style="font-size:1.1rem">{{ t('of_none', n=horizon) }}</b>{% endif %}</div>
+ {% if f.cause %}<div>{{ t('of_cause') }}: <b>{{ f.cause|join(', ') }}</b></div>{% endif %}
+ {% if f.blocked_now %}<div class="warnbox">⛔ {{ t('of_block_now', n=truck) }}</div>
+ {% elif f.block_date %}<div class="warnbox">⛔ {{ t('of_block', d=f.block_date, n=truck) }}</div>{% endif %}
+ {% if f.timeline %}<h2 style="margin:14px 0 4px">{{ t('of_list') }}</h2>
+ {% for e in f.timeline %}<div class="item"{% if e.short %} style="color:#e53935;font-weight:700"{% endif %}><span>{{ e.date }} · {{ e.name }}</span>
+  <span>−{{ e.tons }}t → {{ t('of_short') if e.short else t('of_left', x=e.left) }}</span></div>{% endfor %}{% endif %}
+ <h2 style="margin:14px 0 4px">{{ t('of_habits') }}</h2>
+ {% for h in f.herders %}<div class="item"><span>{{ h.name }}{% if h.pending_t %} <span class="badge warn">{{ t('of_pending', t=h.pending_t) }}</span>{% endif %}</span>
+  <span class="muted">{% if h.interval_d %}{{ t('of_habit', t=h.avg_t, d=h.interval_d, nx=h.next) }}{% else %}{{ t('of_few', n=h.n_orders) }}{% endif %}</span></div>{% endfor %}
+ <div class="muted" style="margin-top:8px">{{ t('of_used', m=f.n_used, n=f.n_herders) }} · {{ t('of_note') }}</div>
+{% endif %}</div>
 <div class="card"><h2>{{ t('trend') }}</h2>{{ chart|safe }}</div>
 <div class="card"><h2>{{ t('grp_this') }}</h2>
  <div class="gauge"><div class="ok" style="width:{{ (a.pend/truck*100)|round|int if a.pend<truck else 100 }}%"></div></div>
@@ -662,6 +1077,7 @@ ORDER = """{% extends "base.html" %}{% block content %}
 
 ADMIN = """{% extends "base.html" %}{% block content %}
 <h1>{{ t('admin_title') }}<span class="sub">{{ t('admin_sub') }}</span></h1>
+<a href="/admin/stats"><button type="button" class="outline" style="margin-bottom:12px">{{ t('st_open') }}</button></a>
 <div class="card"><h2>{{ t('priority') }}</h2>
 {% for w, p, a in rows %}
 <a class="card-link" href="/warehouse/{{ w.id }}"><div class="item">
@@ -741,7 +1157,33 @@ form.addEventListener('submit', function(e){
 </script>
 {% endblock %}"""
 
-app.jinja_loader = DictLoader({"base.html": BASE, "index.html": INDEX, "detail.html": DETAIL,
+STATS = """{% extends "base.html" %}{% block content %}
+<a href="/admin" class="muted" style="text-decoration:none">{{ t('st_back') }}</a>
+<h1 style="margin-top:8px">📈 {{ t('st_title') }}<span class="sub">{{ t('st_sub') }}</span></h1>
+<div style="display:flex;gap:6px;margin-bottom:12px">
+{% for key in ['day', 'week', 'month'] %}<a href="/admin/stats?period={{ key }}" style="flex:1"><button type="button" class="{{ '' if key == period else 'outline' }}">{{ t('st_' ~ key) }}</button></a>{% endfor %}</div>
+<div class="card"><div style="display:flex;justify-content:space-around;text-align:center">
+ <div><div class="big">{{ s.total.attempts }}</div><div class="muted">{{ t('st_attempts') }}</div></div>
+ <div><div class="big">{{ s.rate }}%</div><div class="muted">{{ t('st_rate') }}</div></div>
+ <div><div class="big">{{ s.total.tons }}t</div><div class="muted">{{ t('st_tons') }}</div></div></div></div>
+<div class="card"><h2>{{ t('st_chart') }}</h2>{{ chart|safe }}<div class="muted">🟩 {{ t('st_ok') }} · 🟥 {{ t('st_fail') }}</div></div>
+<div class="card"><h2>{{ t('st_by_period') }}</h2>
+{% for b in s.buckets|reverse %}{% if b.attempts %}<div class="item"><span>{{ b.label }}</span><span><b>{{ b.attempts }}</b> <span class="muted">({{ t('st_ok') }} {{ b.ok }} · {{ t('st_fail') }} {{ b.fail }}) · {{ b.tons }}t</span></span></div>{% endif %}{% endfor %}
+{% if not s.total.attempts %}<div class="muted">{{ t('st_none') }}</div>{% endif %}</div>
+<div class="card"><h2>{{ t('st_by_wh') }}</h2>
+{% for r in s.by_wh %}<div class="item"><span>{{ wh_name(r.key) }}</span><span><b>{{ r.attempts }}</b> <span class="muted">({{ t('st_ok') }} {{ r.ok }} · {{ t('st_fail') }} {{ r.fail }}) · {{ r.tons }}t</span></span></div>{% endfor %}
+{% if not s.by_wh %}<div class="muted">{{ t('st_none') }}</div>{% endif %}</div>
+<div class="card"><h2>{{ t('st_by_ch') }}</h2>
+{% for r in s.by_ch %}<div class="item"><span>{{ t(r.label_key) }}</span><span><b>{{ r.attempts }}</b> <span class="muted">({{ t('st_ok') }} {{ r.ok }} · {{ t('st_fail') }} {{ r.fail }}) · {{ r.tons }}t</span></span></div>{% endfor %}
+{% if not s.by_ch %}<div class="muted">{{ t('st_none') }}</div>{% endif %}</div>
+<div class="card"><h2>{{ t('st_reasons') }}</h2>
+{% for r in s.reasons %}<div class="item"><span>{{ t('rs_' ~ r.key) }}</span><b>{{ r.n }}</b></div>{% endfor %}
+{% if not s.reasons %}<div class="muted">{{ t('st_none') }}</div>{% endif %}</div>
+<a href="/admin/export/requests.csv"><button type="button" class="secondary">⬇ {{ t('st_csv_req') }}</button></a>
+<a href="/admin/export/orders.csv"><button type="button" class="secondary">⬇ {{ t('st_csv_orders') }}</button></a>
+{% endblock %}"""
+
+app.jinja_loader = DictLoader({"base.html": BASE, "index.html": INDEX, "detail.html": DETAIL, "stats.html": STATS,
                                "order.html": ORDER, "admin.html": ADMIN, "pin.html": PIN, "chat.html": CHAT})
 
 def avail_map():
@@ -822,6 +1264,26 @@ def admin():
     deliveries = q("SELECT * FROM deliveries ORDER BY ts DESC, id DESC LIMIT 10")
     return render_template("admin.html", rows=rows, av=avail_map(), sel=WAREHOUSES[0]["id"], deliveries=deliveries)
 
+@app.route("/admin/stats")
+@admin_required
+def admin_stats():
+    s = request_stats(request.args.get("period", "day"))
+    return render_template("stats.html", s=s, period=s["period"], chart=svg_bars(s["buckets"]))
+
+@app.route("/admin/export/requests.csv")
+@admin_required
+def export_requests():
+    cols = ["id", "ts", "warehouse_id", "herder", "phone", "tons", "channel", "ok", "reason", "stock_t", "avail_t", "pending_t", "lang", "raw"]
+    rows = q(f"SELECT {', '.join(cols)} FROM request_log ORDER BY ts DESC, id DESC")
+    return csv_response("haylink_requests.csv", cols, [[r[c] for c in cols] for r in rows])
+
+@app.route("/admin/export/orders.csv")
+@admin_required
+def export_orders():
+    cols = ["id", "ts", "warehouse_id", "herder", "phone", "tons", "channel", "status"]
+    rows = q(f"SELECT {', '.join(cols)} FROM orders ORDER BY ts DESC, id DESC")
+    return csv_response("haylink_orders.csv", cols, [[r[c] for c in cols] for r in rows])
+
 @app.route("/admin/login", methods=["POST"])
 def admin_login():
     pin = request.form.get("pin", "")
@@ -847,8 +1309,10 @@ def api_reading():
 @app.route("/api/sms", methods=["POST"])
 def api_sms():
     src = request.get_json(silent=True) or request.form
-    parsed, err = parse_sms(src.get("text", ""))
-    if not parsed: return redirect(msg_url("/order", "msg_sms_err", kind="err", e=err))
+    parsed, err, err_code = parse_sms(src.get("text", ""))
+    if not parsed:
+        log_request(False, err_code, phone=src.get("phone", ""), channel="sms", raw=src.get("text", ""))
+        return redirect(msg_url("/order", "msg_sms_err", kind="err", e=err))
     ok, key, kw = try_add_order(parsed["warehouse_id"], parsed["herder"], src.get("phone", ""), parsed["tons"], "sms")
     if ok:
         pend, _ = pending_tons(parsed["warehouse_id"])
