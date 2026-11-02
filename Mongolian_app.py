@@ -214,6 +214,8 @@ T = {
  "pin_ph":       {"ko": "PIN", "en": "PIN", "mn": "PIN"},
  "pin_btn":      {"ko": "확인", "en": "Enter", "mn": "Нэвтрэх"},
  "pin_bad":      {"ko": "PIN이 올바르지 않습니다", "en": "Wrong PIN", "mn": "PIN буруу байна"},
+ "logout":       {"ko": "로그아웃 (사용자 화면으로)", "en": "Log out (back to user view)", "mn": "Гарах (хэрэглэгчийн харагдац руу)"},
+ "msg_logout":   {"ko": "로그아웃했어요. 지금은 일반 사용자 화면이에요", "en": "Logged out. You are now seeing the user view", "mn": "Гарлаа. Одоо хэрэглэгчийн харагдац байна"},
  # 운영 모드 전환 (관리자)
  "mode_title":   {"ko": "운영 모드 전환", "en": "Switch operating mode", "mn": "Ажиллах горим солих"},
  "mode_now":     {"ko": "지금 모드", "en": "Current mode", "mn": "Одоогийн горим"},
@@ -309,7 +311,7 @@ def pick_lang():
 
 @app.context_processor
 def inject():
-    return {"t": t, "lang": g.lang, "wh_name": wh_name, "demo": is_demo(), "mode_switch": MODE_SWITCHABLE, "truck": TRUCK_CAPACITY_T,
+    return {"t": t, "lang": g.lang, "wh_name": wh_name, "demo": is_demo(), "privacy": privacy_on(), "pin_on": bool(ADMIN_PIN), "mode_switch": MODE_SWITCHABLE, "truck": TRUCK_CAPACITY_T,
             "lead": LEAD_DAYS, "bale": HAY_BALE_TON, "order_min": ORDER_MIN_T, "warehouses": WAREHOUSES,
             "horizon": FORECAST_HORIZON_D, "min_orders": MIN_ORDERS_FOR_CYCLE}
 
@@ -696,6 +698,11 @@ def cold_factor(tm):
     if tm <= -15:   return 1.15, "cold_mild"
     return 1.0, "cold_normal"
 
+def privacy_on():
+    """실제 운영 모드에서 관리자(PIN 로그인)가 아닌 사람에게는 농가 이름을 숨김. 시연 모드의 가짜 이름은 그대로 보여 줌"""
+    is_admin = bool(ADMIN_PIN) and has_request_context() and admin_ok()
+    return not is_demo() and not is_admin
+
 def herder_cycles(wid):
     """농가별 주문 습관. 농가 구분은 전화번호(없으면 이름). 주문 기록이 MIN_ORDERS_FOR_CYCLE 회 이상이면
        평균 주문량(최근 4회)·평균 주기(최근 6간격, 일)·다음 예상 주문일을 계산"""
@@ -743,15 +750,16 @@ def order_forecast(w, stock_t):
         timeline.append({"d": d, "name": name, "tons": tons, "left": round(max(left, 0.0), 1), "short": left <= 1e-9})
     fmt = lambda d: d.strftime("%m/%d") if d else None
     herders.sort(key=lambda h: (h["next_date"] is None, h["next_date"] or today, h["name"]))
+    hide = privacy_on()          # 실제 운영 모드의 일반 사용자에게는 누가 언제 얼마를 신청했는지(개인별 내역)를 주지 않고, 예측 결과(매진·차단 날짜)만 줌
     return {
         "n_herders": len(herders), "n_used": sum(1 for h in herders if h["interval_d"]),
         "has_data": any(h["interval_d"] for h in herders),          # 주기를 아는 농가가 한 곳도 없으면 예측 근거 없음
         "stockout_date": fmt(stockout), "days": (stockout - today).days if stockout else None,
-        "cause": [e["name"] for e in timeline if e["d"] == stockout],
+        "cause": [] if hide else [e["name"] for e in timeline if e["d"] == stockout],
         "block_date": fmt(block), "blocked_now": blocked_now,
-        "timeline": [{"date": fmt(e["d"]), "name": e["name"], "tons": e["tons"], "left": e["left"], "short": e["short"]} for e in timeline[:10]],
-        "herders": [{"name": h["name"], "avg_t": h["avg_t"], "interval_d": h["interval_d"], "next": fmt(h["next_date"]) or "-",
-                     "n_orders": h["n_orders"], "pending_t": h["pending_t"]} for h in herders],
+        "timeline": [] if hide else [{"date": fmt(e["d"]), "name": e["name"], "tons": e["tons"], "left": e["left"], "short": e["short"]} for e in timeline[:10]],
+        "herders": [] if hide else [{"name": h["name"], "avg_t": h["avg_t"], "interval_d": h["interval_d"], "next": fmt(h["next_date"]) or "-",
+                                     "n_orders": h["n_orders"], "pending_t": h["pending_t"]} for h in herders],
     }
 
 def empty_forecast():
@@ -1004,6 +1012,21 @@ def suggest_questions(text):
 
 LANG_NAME = {"ko": "Korean", "en": "English", "mn": "Mongolian"}
 
+# 챗봇에게 알려 줄 날씨 단계 이름: 코드(NORMAL)나 배율(x1.3) 대신 사람이 쓰는 말로
+WEATHER_LABELS = {
+    "NORMAL":    {"ko": "맑음·평소 날씨", "en": "clear / normal weather", "mn": "цэлмэг, ердийн цаг агаар"},
+    "WARNING":   {"ko": "한파·길 얼음", "en": "cold snap / icy roads", "mn": "хүйтний давалгаа, мөстсөн зам"},
+    "CRITICAL":  {"ko": "폭설", "en": "heavy snow", "mn": "их хэмжээний цас"},
+    "EMERGENCY": {"ko": "폭설로 길이 막힌 비상 상황", "en": "blizzard, roads closed (emergency)", "mn": "шуурганы улмаас зам хаагдсан онцгой байдал"},
+}
+
+def weather_label(code):
+    return WEATHER_LABELS.get(code, {}).get(g.lang) or WEATHER_LABELS.get(code, {}).get("en") or "unknown weather"
+
+def extra_fee_txt(mult):
+    pct = round((float(mult) - 1) * 100)
+    return f"about {pct}% extra delivery fee" if pct > 0 else "no extra weather fee"
+
 def warehouse_context():
     """AI에게 알려 줄 현재 창고 상황 (재고·소진 예상·신청 가능량)"""
     lines = []
@@ -1014,7 +1037,8 @@ def warehouse_context():
                        else f"forecast min temp {dw['temp_c'] if dw['temp_c'] is not None else 'unknown'} C, snow depth unknown")
         of = p["order_fc"]
         if of["stockout_date"]:
-            fc_txt = f"order-based forecast: stock runs out {of['stockout_date']} (in {of['days']} days) when orders from {', '.join(of['cause'])} come"
+            fc_txt = f"order-based forecast: stock runs out {of['stockout_date']} (in {of['days']} days)"
+            if of["cause"]: fc_txt += f" when orders from {', '.join(of['cause'])} come"
         elif of["has_data"]:
             fc_txt = f"order-based forecast: no stockout expected within {FORECAST_HORIZON_D} days"
         else:
@@ -1023,12 +1047,12 @@ def warehouse_context():
         elif of["block_date"]: fc_txt += f"; requests expected to close around {of['block_date']} (stock below one truck)"
         upcoming = "; ".join(f"{e['date']} {e['name']} {e['tons']}t" for e in of["timeline"][:5])
         if upcoming: fc_txt += f"; next expected orders: {upcoming}"
-        fc_txt += f"; based on {of['n_used']} of {of['n_herders']} herders' ordering cycles"
+        if of["herders"]: fc_txt += f"; based on {of['n_used']} of {of['n_herders']} herders' ordering cycles"
         lines.append(f"- {w['name']['en']} (id {w['id']}): stock {p['cur_pct']}% (~{p['cur_ton']}t of {w['capacity_ton']}t), "
                      f"daily use {p['per_day']}%, runs out {p['deplete_date']}, status {p['level']}, "
                      f"pending requests {a['pend']}t, available to request {a['avail']}t, "
                      f"requests {'open' if a['truck_possible'] else 'closed (stock below one truck)'}, "
-                     f"delivery weather level {dw['condition']} (fee x{dw['multiplier']}; {weather_txt}), "
+                     f"delivery weather now: {weather_label(dw['condition'])} ({extra_fee_txt(dw['multiplier'])}; {weather_txt}), "
                      f"displayed run-out date {p['deplete_date']} ({p['stockout_source'] or 'none'}-based), {fc_txt}")
     return "\n".join(lines)
 
@@ -1041,10 +1065,10 @@ def cost_context():
         if i["item_code"] == "HAY_BALE":
             lines.append(f"- Natural hay per ton (= {BALES_PER_TON} bales of 25 kg): normal-season about {i['normal_price_mnt'] * BALES_PER_TON:,} MNT, "
                          f"dzud-peak market about {i['dzud_peak_price_mnt'] * BALES_PER_TON:,} MNT, relief about {i['subsidized_price_mnt'] * BALES_PER_TON:,} MNT")
-    lines.append(f"Delivery fee estimate = (base {BASE_FARE_MNT:,} MNT + {PER_KM_FARE_MNT:,} MNT per km) x weather multiplier; the truck fee is split among the households sharing the delivery.")
+    lines.append(f"Delivery fee estimate = base {BASE_FARE_MNT:,} MNT + {PER_KM_FARE_MNT:,} MNT per km, plus an extra for bad weather; the truck fee is split among the households sharing the delivery.")
     for r in cached_rows("SELECT condition_code, condition_name_ko, cost_multiplier FROM weather_delivery_rates ORDER BY cost_multiplier"):
         total = round((BASE_FARE_MNT + 100 * PER_KM_FARE_MNT) * r["cost_multiplier"])
-        lines.append(f"  - weather level {r['condition_code']}: x{r['cost_multiplier']} -> for 100 km about {total:,} MNT per truck (about {round(total / 4):,} MNT each if 4 households share)")
+        lines.append(f"  - if the weather is {weather_label(r['condition_code'])} ({extra_fee_txt(r['cost_multiplier'])}): for 100 km about {total:,} MNT per truck, about {round(total / 4):,} MNT per household if 4 households share")
     return "\n".join(lines)
 
 def ask_llm(text, history):
@@ -1061,20 +1085,30 @@ def ask_llm(text, history):
         "(works with 2G signal), or by the bagh leader / warehouse manager on behalf of a herder without signal. "
         "Requests from one warehouse are delivered together once pending requests reach one truck (5 t). "
         "Use only the data below for stock questions; if you don't know, say so and suggest contacting the administrator. "
+        "How stock is measured: an ultrasonic sensor mounted on the ceiling of each warehouse measures the distance down to the hay pile "
+        "(the closer the hay is to the ceiling, the fuller the warehouse); the app converts that distance into remaining stock (% and tons) "
+        "and saves it automatically in the app's database, which is also how the run-out forecast follows real consumption. "
+        "The real sensors are not installed yet: for now the stock figures come from sample data or are entered by the administrator, "
+        "and the sensor connection is being prepared. If asked how stock is known, explain the ceiling sensor; if asked whether the sensors are already working, "
+        "say honestly that they are being prepared. Do not claim a figure is a live sensor reading. "
         "Each warehouse has a run-out forecast: the app learns each herder's usual order amount and cycle, predicts upcoming orders, "
         "and subtracts them from the current stock; the displayed run-out date is the earlier of this order-based date and the sensor-trend date. "
         "When asked when a warehouse will run out or sell out, give that date, name the herders whose expected orders cause it, "
         "mention when requests are expected to close (stock below one truck), and say it is an estimate from past ordering habits. "
-        "For price or cost questions use only the estimates below. Always present them as rough estimates based on dzud-period market levels, never as official or fixed prices: "
-        "say 'about' and give the amount; explain that hay is priced at the dzud-peak market level and that relief (subsidized) supply may be cheaper; "
-        "that bad weather (severe cold, heavy snow, icy roads) makes delivery harder and can add an extra delivery fee (the weather multiplier), "
-        "and that the truck fee is divided among households sharing the delivery, so joining a shared delivery lowers each household's cost. "
-        "Explain this in a calm, reassuring tone, and say the final amount is confirmed by the administrator before delivery. "
-        "Each warehouse below has its current delivery weather level; when asked about weather or extra delivery fees, state the current level for the relevant warehouse(s) "
-        "and say that conditions can change before delivery (the weather figures are model estimates). "
+        "For price or cost questions use only the estimates below, and make the answer SHORT and easy to take in at a glance: "
+        "2 to 3 short lines, at most about 40 words, no lists, no formulas, no background unless the user asks for it. "
+        "Line 1 starts with 💰 and gives the main amount first, e.g. '💰 About 330,000 MNT per truck (100 km), about 82,500 MNT per household if 4 share.' "
+        "Give only one comparison, and only if useful (for example the amount in clear weather versus in heavy snow). "
+        "Then one short sentence: it is a rough estimate and the administrator confirms the final amount before delivery. "
+        "Always say 'about' and never present a price as official or fixed. If asked about hay, give the dzud-peak market price and mention in a few words that relief supply may be cheaper. "
+        "Mention a shared delivery only in a few words (the truck fee is divided among the households). "
+        "Describe weather in plain words such as clear, cold snap, heavy snow, blizzard, and the extra fee as a percent; "
+        "NEVER write level codes (NORMAL, WARNING, CRITICAL, EMERGENCY) or multipliers like x1.3. "
+        "Each warehouse below shows its current delivery weather; when asked about weather or extra fees, say it in one short sentence "
+        "(for example 'Now it is heavy snow, so about 80% extra delivery fee') and add that conditions can change before delivery. "
         "Never say for certain that hay or delivery is free or must be paid for; say it depends (relief supply may be cheaper or supported) and the administrator confirms. "
         "For a 'free?' question, do not begin with 'yes' or 'no': begin with 'it depends'. "
-        "Write dzud as 조드 in Korean and as зуд in Mongolian. "
+        "Write dzud as 조드 in Korean and as зуд in Mongolian, using only that one word (never add another language in parentheses). "
         "Do not invent prices or distances that are not given below.\n\n"
         "Current warehouse data:\n" + warehouse_context() + "\n\nPrice and delivery cost estimates (reference only):\n" + cost_context()
     )
@@ -1206,10 +1240,10 @@ DETAIL = """{% extends "base.html" %}{% block content %}
  {% if f.timeline %}<h2 style="margin:14px 0 4px">{{ t('of_list') }}</h2>
  {% for e in f.timeline %}<div class="item"{% if e.short %} style="color:#e53935;font-weight:700"{% endif %}><span>{{ e.date }} · {{ e.name }}</span>
   <span>−{{ e.tons }}t → {{ t('of_short') if e.short else t('of_left', x=e.left) }}</span></div>{% endfor %}{% endif %}
- <h2 style="margin:14px 0 4px">{{ t('of_habits') }}</h2>
+ {% if f.herders %}<h2 style="margin:14px 0 4px">{{ t('of_habits') }}</h2>
  {% for h in f.herders %}<div class="item"><span>{{ h.name }}{% if h.pending_t %} <span class="badge warn">{{ t('of_pending', t=h.pending_t) }}</span>{% endif %}</span>
-  <span class="muted">{% if h.interval_d %}{{ t('of_habit', t=h.avg_t, d=h.interval_d, nx=h.next) }}{% else %}{{ t('of_few', n=h.n_orders) }}{% endif %}</span></div>{% endfor %}
- <div class="muted" style="margin-top:8px">{{ t('of_used', m=f.n_used, n=f.n_herders) }} · {{ t('of_note') }}</div>
+  <span class="muted">{% if h.interval_d %}{{ t('of_habit', t=h.avg_t, d=h.interval_d, nx=h.next) }}{% else %}{{ t('of_few', n=h.n_orders) }}{% endif %}</span></div>{% endfor %}{% endif %}
+ <div class="muted" style="margin-top:8px">{% if not privacy %}{{ t('of_used', m=f.n_used, n=f.n_herders) }} · {% endif %}{{ t('of_note') }}</div>
 {% endif %}</div>
 <div class="card"><h2>{{ t('trend') }}</h2>{{ chart|safe }}</div>
 <div class="card"><h2>{{ t('grp_this') }}</h2>
@@ -1256,16 +1290,17 @@ ORDER = """{% extends "base.html" %}{% block content %}
   <input name="text" placeholder="HAY zuunmod 2 Bold" required>
   <button type="submit" class="secondary">{{ t('process_sms') }}</button></form>
  <p class="muted" style="margin:6px 0 0">{{ t('sms_note')|safe }}</p></div>
-<div class="card"><h2>{{ t('recent') }}</h2>
+{% if not privacy %}<div class="card"><h2>{{ t('recent') }}</h2>
 {% set ch = {'app':'ch_app','sms':'ch_sms','proxy':'ch_proxy'} %}
 {% for o in orders %}<div class="item"><div><b>{{ o.herder }}</b> · {{ o.tons }}t<div class="muted">{{ wh_name(o.warehouse_id) }} · {{ o.ts[5:16].replace('T',' ') }}</div></div>
  <div style="text-align:right"><div>{{ t(ch.get(o.channel, 'ch_app')) }}</div><div class="muted">{{ t('pending') if o.status=='pending' else t('dispatched') }}</div></div></div>{% endfor %}
-{% if not orders %}<div class="muted">{{ t('none_yet') }}</div>{% endif %}</div>
+{% if not orders %}<div class="muted">{{ t('none_yet') }}</div>{% endif %}</div>{% endif %}
 {% endblock %}"""
 
 ADMIN = """{% extends "base.html" %}{% block content %}
 <h1>{{ t('admin_title') }}<span class="sub">{{ t('admin_sub') }}</span></h1>
 <a href="/admin/stats"><button type="button" class="outline" style="margin-bottom:12px">{{ t('st_open') }}</button></a>
+{% if pin_on %}<form method="post" action="/admin/logout" style="margin-bottom:12px"><button type="submit" class="secondary">{{ t('logout') }}</button></form>{% endif %}
 <div class="card"><h2>{{ t('priority') }}</h2>
 {% for w, p, a in rows %}
 <a class="card-link" href="/warehouse/{{ w.id }}"><div class="item">
@@ -1424,7 +1459,7 @@ def order():
         return redirect(msg_url(back, key, kind="ok" if ok else "err", **kw))
     av = avail_map()
     stats = [(w, av[w["id"]]) for w in WAREHOUSES]
-    orders = q("SELECT * FROM orders ORDER BY ts DESC, id DESC LIMIT 15")
+    orders = [] if privacy_on() else q("SELECT * FROM orders ORDER BY ts DESC, id DESC LIMIT 15")   # 실제 운영의 일반 사용자에게는 신청 내역을 보여 주지 않음
     sel = request.args.get("w", WAREHOUSES[0]["id"])
     return render_template("order.html", stats=stats, av=av, orders=orders, sel=sel if sel in WH_BY_ID else WAREHOUSES[0]["id"])
 
@@ -1485,6 +1520,12 @@ def admin_login():
         return redirect(msg_url("/admin", "pin_bad", kind="err"))
     resp = redirect("/admin")
     resp.set_cookie("admin_pin", pin, max_age=60 * 60 * 12, httponly=True, samesite="Lax")
+    return resp
+
+@app.route("/admin/logout", methods=["POST"])
+def admin_logout():
+    resp = redirect(msg_url("/", "msg_logout"))
+    resp.delete_cookie("admin_pin", path="/")
     return resp
 
 @app.route("/api/reading", methods=["POST"])
