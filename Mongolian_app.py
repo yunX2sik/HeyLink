@@ -28,7 +28,8 @@ ORDER_MIN_T      = 0.5           # 1회 최소 신청량
 REFILL_JUMP_PCT  = 8.0           # 측정 간 재고가 이만큼 이상 늘면 '입고'로 간주
 TEMP_TTL_S       = 3600          # 기온 캐시 유효시간(초)
 ADMIN_PIN        = os.environ.get("HAYLINK_ADMIN_PIN", "")   # 빈 문자열이면 보호 없음
-GEMINI_MODEL     = os.environ.get("HAYLINK_GEMINI_MODEL", "gemini-3.5-flash-lite")   # 챗봇용 Gemini 모델 (무료 키로 사용 가능)
+GEMINI_MODELS    = os.environ.get("HAYLINK_GEMINI_MODEL", "gemini-3.1-flash-lite,gemini-3.5-flash").split(",")   # 앞 모델이 오류·지연이면 다음 모델 시도 (무료 키로 사용 가능)
+GEMINI_TIMEOUT_S = 12            # 모델 하나당 최대 대기 시간(초). 서버가 30초를 넘기면 요청을 끊으므로 짧게 둠
 CHAT_MAX_TURNS   = 10            # AI에게 함께 보내는 이전 대화 최대 개수
 QUESTION_DB_FILE = "questions.db"   # import_questions.py 가 만드는 자주 묻는 질문 DB (데모 초기화에 지워지지 않도록 따로 둠)
 SUGGEST_COUNT    = 6                # 주제 단어만 입력했을 때 보여 줄 질문 버튼 수
@@ -500,16 +501,18 @@ def ask_llm(text, history):
     msgs.append({"role": "user", "parts": [{"text": text[:1000]}]})
     body = json.dumps({"system_instruction": {"parts": [{"text": system}]}, "contents": msgs,
                        "generationConfig": {"maxOutputTokens": 600}}).encode("utf-8")
-    req = urllib.request.Request(
-        f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
-        data=body, headers={"Content-Type": "application/json", "x-goog-api-key": key})
-    try:
-        with urllib.request.urlopen(req, timeout=20) as res:
-            parts = json.loads(res.read())["candidates"][0]["content"]["parts"]
-        return "".join(p.get("text", "") for p in parts).strip() or None
-    except Exception as e:
-        print("Gemini API error:", e)
-        return None
+    for model in GEMINI_MODELS:
+        req = urllib.request.Request(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model.strip()}:generateContent",
+            data=body, headers={"Content-Type": "application/json", "x-goog-api-key": key})
+        try:
+            with urllib.request.urlopen(req, timeout=GEMINI_TIMEOUT_S) as res:
+                parts = json.loads(res.read())["candidates"][0]["content"]["parts"]
+            answer = "".join(p.get("text", "") for p in parts).strip()
+            if answer: return answer
+        except Exception as e:
+            print(f"Gemini API error ({model}):", e)
+    return None
 
 # ═══════════════════ 화면 (모바일 UI) ═══════════════════
 # 템플릿 이름에 .html 을 붙여야 Jinja 자동 이스케이프가 켜짐 (v0.2는 꺼져 있어 XSS 가능했음)
