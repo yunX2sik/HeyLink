@@ -41,9 +41,10 @@ TEMP_TTL_S       = 3600          # 기온 캐시 유효시간(초)
 ADMIN_PIN        = os.environ.get("HAYLINK_ADMIN_PIN", "")   # 빈 문자열이면 보호 없음
 MODE_SWITCHABLE  = USE_PG and bool(ADMIN_PIN) and not os.environ.get("HAYLINK_PG_SCHEMA")   # 관리자 화면에서 시연/운영 모드를 바꿀 수 있는 조건: Neon 사용 + PIN 설정 (이때 환경변수 HAYLINK_MODE 는 '처음 값'일 뿐)
 MODE_TTL_S       = 5             # 다른 서버(워커)가 모드 변경을 알아채는 데 걸리는 최대 시간(초)
-GEMINI_MODELS    = os.environ.get("HAYLINK_GEMINI_MODEL", "gemini-3.1-flash-lite,gemini-3.5-flash").split(",")   # 앞 모델이 오류·지연이면 다음 모델 시도 (무료 키로 사용 가능)
+GEMINI_MODELS    = os.environ.get("HAYLINK_GEMINI_MODEL", "gemini-3.5-flash-lite,gemini-3-flash-preview,gemini-3.5-flash,gemini-3.1-flash-lite").split(",")   # 앞 모델이 오류·지연이면 다음 모델 시도 (무료 키로 사용 가능)
 GEMINI_TOTAL_S   = 25            # 재시도 포함 전체 대기 한도(초). 서버 제한 30초보다 짧게
-GEMINI_TIMEOUT_S = 12           # 모델 하나당 최대 대기 시간(초). 서버가 30초를 넘기면 요청을 끊으므로 짧게 둠
+GEMINI_MAX_OUT  = 2000           # 답변 길이 한도(생각에 쓰는 글자 포함)
+GEMINI_TIMEOUT_S = 9          # 모델 하나당 최대 대기 시간(초). 서버가 30초를 넘기면 요청을 끊으므로 짧게 둠
 CHAT_MAX_TURNS   = 10            # AI에게 함께 보내는 이전 대화 최대 개수
 QUESTION_DB_FILE = "questions.db"   # import_questions.py 가 만드는 자주 묻는 질문 DB (데모 초기화에 지워지지 않도록 따로 둠)
 SUGGEST_COUNT    = 6                # 주제 단어만 입력했을 때 보여 줄 질문 버튼 수
@@ -1151,25 +1152,29 @@ def ask_llm(text, history):
             if isinstance(h, dict) and h.get("role") in ("user", "assistant") and h.get("content")]
     while msgs and msgs[0]["role"] != "user": msgs.pop(0)
     msgs.append({"role": "user", "parts": [{"text": text[:1000]}]})
-    body = json.dumps({"system_instruction": {"parts": [{"text": system}]}, "contents": msgs,
-                       "generationConfig": {"maxOutputTokens": 600}}).encode("utf-8")
     deadline = time.time() + GEMINI_TOTAL_S
     for model in GEMINI_MODELS:
-        for attempt in range(2):   # 모델이 "바빠요"라고 바로 거절하면 잠깐 뒤 한 번 더 시도
+        model = model.strip()
+        cfg = {"maxOutputTokens": GEMINI_MAX_OUT}
+        if "lite" not in model: cfg["thinkingConfig"] = {"thinkingLevel": "low"}   # 속으로 오래 생각하느라 답이 잘리는 것을 막음
+        body = json.dumps({"system_instruction": {"parts": [{"text": system}]}, "contents": msgs,
+                           "generationConfig": cfg}).encode("utf-8")
+        for attempt in range(2):   # 모델이 "바빠요"(500·503)라고 바로 거절하면 잠깐 뒤 한 번 더 시도
             left = deadline - time.time()
             if left < 3: return None
             req = urllib.request.Request(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{model.strip()}:generateContent",
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
                 data=body, headers={"Content-Type": "application/json", "x-goog-api-key": key})
             try:
                 with urllib.request.urlopen(req, timeout=min(GEMINI_TIMEOUT_S, left)) as res:
-                    parts = json.loads(res.read())["candidates"][0]["content"]["parts"]
-                answer = "".join(p.get("text", "") for p in parts).strip()
-                if answer: return answer
+                    cand = json.loads(res.read())["candidates"][0]
+                answer = "".join(p.get("text", "") for p in cand["content"]["parts"]).strip()
+                if answer and cand.get("finishReason") != "MAX_TOKENS": return answer   # 중간에 잘린 답은 쓰지 않고 다음 모델로
+                print(f"Gemini answer unusable ({model}): finish={cand.get('finishReason')}")
                 break
             except urllib.error.HTTPError as e:
                 print(f"Gemini API error ({model}, try {attempt + 1}):", e)
-                if e.code in (429, 500, 503) and attempt == 0:
+                if e.code in (500, 503) and attempt == 0:   # 429(하루 한도 초과)는 다시 물어도 소용없어 바로 다음 모델로
                     time.sleep(1.5); continue
                 break
             except Exception as e:   # 시간 초과 등: 같은 모델을 또 기다리지 않고 다음 모델로
