@@ -296,11 +296,11 @@ T = {
  "sms_num":      {"ko": "톤수는 숫자여야 함", "en": "Tons must be a number", "mn": "Тонн нь тоо байх ёстой"},
  "sms_herder":   {"ko": "SMS 목민", "en": "SMS herder", "mn": "SMS малчин"},
  # 내 신청 확인 대화 (이름·전화번호·창고를 차례로 물어봄. 이 대화는 AI에게 보내지 않음)
- "oc_ask_name":  {"ko": "네, 신청 내역을 확인해 드릴게요 😊\n먼저 신청하실 때 쓰신 이름을 알려 주세요.", "en": "Sure, let me check your request 😊\nFirst, what name did you use when you requested?", "mn": "За, захиалгыг тань шалгаж өгье 😊\nЭхлээд захиалахдаа бичсэн нэрээ хэлнэ үү."},
- "oc_ask_phone": {"ko": "{name}님, 반가워요! 이번에는 신청 때 적으신 전화번호를 알려 주세요. (예: 9911 2233)", "en": "Nice to meet you, {name}! Now, what phone number did you use? (e.g. 9911 2233)", "mn": "{name}, сайн байна уу! Одоо захиалахдаа бичсэн утасны дугаараа хэлнэ үү. (жишээ нь: 9911 2233)"},
- "oc_bad_phone": {"ko": "전화번호를 숫자로 다시 알려 주세요 (7자리 이상).", "en": "Please type the phone number again, digits only (at least 7).", "mn": "Утасны дугаараа тоогоор дахин бичнэ үү (дор хаяж 7 орон)."},
- "oc_ask_wh":    {"ko": "마지막이에요! 어느 창고에 신청하셨나요?\n({list})", "en": "Last one! Which warehouse did you request from?\n({list})", "mn": "Сүүлчийнх! Аль агуулахад захиалсан бэ?\n({list})"},
- "oc_bad_wh":    {"ko": "창고 이름을 못 찾았어요. 이 중에서 알려 주세요: {list}", "en": "I couldn't find that warehouse. Please pick one: {list}", "mn": "Агуулахын нэрийг олсонгүй. Эдгээрээс сонгоно уу: {list}"},
+ "oc_intro":    {"ko": "네, 신청 내역을 확인해 드릴게요 😊\n이름, 전화번호, 신청한 창고를 한 번에 알려 주세요.\n(예: 홍길동 9911 2233 준모드)\n창고: {list}", "en": "Sure, let me check your request 😊\nPlease tell me your name, phone number and warehouse in one message.\n(e.g. Bat 9911 2233 Zuunmod)\nWarehouses: {list}", "mn": "За, захиалгыг тань шалгаж өгье 😊\nНэр, утасны дугаар, захиалсан агуулахаа нэг дор хэлнэ үү.\n(жишээ нь: Бат 9911 2233 Зуунмод)\nАгуулах: {list}"},
+ "oc_need":     {"ko": "{what}도 알려 주세요 🙏", "en": "Please also tell me your {what} 🙏", "mn": "Мөн {what} хэлнэ үү 🙏"},
+ "oc_l_name":   {"ko": "이름", "en": "name", "mn": "нэр"},
+ "oc_l_phone":  {"ko": "전화번호", "en": "phone number", "mn": "утасны дугаар"},
+ "oc_l_wh":     {"ko": "신청한 창고 ({list})", "en": "warehouse ({list})", "mn": "агуулах ({list})"},
  "oc_found":     {"ko": "확인했어요! {name}님의 {wh} 신청 내역이에요 👇\n{lines}\n\n대기 중인 신청은 같은 창고 신청이 트럭 1대({truck}t)가 되면 함께 배송 요청돼요.", "en": "Found it! Here are {name}'s requests at {wh} 👇\n{lines}\n\nPending requests are sent together once the requests from one warehouse reach one truck ({truck} t).", "mn": "Шалгалаа! {name}-ийн {wh} дахь захиалга 👇\n{lines}\n\nХүлээгдэж буй захиалгууд нэг ачааны машин ({truck}т) болмогц хамт хүргэгдэнэ."},
  "oc_none":      {"ko": "말씀하신 정보로 신청을 찾지 못했어요 😢\n이름, 전화번호, 창고를 다시 한번 확인해 주세요.\n다시 확인하려면 \"내 주문 확인\"이라고 입력해 주세요.", "en": "I couldn't find a request with that information 😢\nPlease double-check the name, phone number and warehouse.\nTo try again, type \"check my order\".", "mn": "Таны хэлсэн мэдээллээр захиалга олдсонгүй 😢\nНэр, утасны дугаар, агуулахаа дахин нягтална уу.\nДахин шалгахын тулд \"миний захиалга шалгах\" гэж бичнэ үү."},
  "oc_cancel":    {"ko": "알겠어요, 확인을 멈출게요. 궁금한 게 있으면 언제든 물어보세요!", "en": "Okay, I'll stop checking. Ask me anything anytime!", "mn": "За, шалгахаа зогсоолоо. Асуух зүйл байвал хэзээ ч асуугаарай!"},
@@ -1640,41 +1640,60 @@ def wants_order_check(text):
     s = (text or "").lower()
     return any(w in s for w in _OC_ORDER_W) and any(w in s for w in _OC_CHECK_W) and not any(w in s for w in _OC_SKIP_W)
 
+_OC_FILLER_PREFIX = ("이름", "전화", "번호", "창고", "신청", "주문", "확인", "저는", "제가", "입니다", "이에요", "예요", "이고", "그리고",
+                     "name", "phone", "number", "warehouse", "нэр", "утас", "дугаар", "агуулах")
+_OC_FILLER_EXACT = ("my", "is", "and", "the", "of")
+
 def match_warehouse(text):
-    s = re.sub(r"\s+", "", (text or "").lower())
+    """말 속에서 창고 이름(첫 낱말)을 찾아 (창고 id, 찾은 낱말)을 돌려줌"""
+    s = (text or "").lower()
     for w in WAREHOUSES:
         for nm in w["name"].values():
             first = nm.split()[0].lower()   # '준모드 1호 창고' → '준모드'
-            if first and first in s: return w["id"]
-    return None
+            if first and first in s: return w["id"], first
+    return None, None
 
-def find_my_orders(name, phone, wid):
-    """이름·전화번호(끝 8자리)가 모두 같은 신청만 찾음"""
+def find_phone(text):
+    """말 속에서 전화번호(숫자 7개 이상)를 찾음. 여러 개면 마지막 것"""
+    best = ""
+    for m in re.finditer(r"\+?\d[\d\s\-]{5,}\d", text or ""):
+        if len(re.sub(r"\D", "", m.group())) >= 7: best = m.group()
+    return best
+
+def has_name_word(text, phone, wh_word):
+    """전화번호·창고 이름·'이름은/입니다' 같은 군더더기를 빼고도 이름처럼 보이는 글자가 남아 있는지"""
+    rest = (text or "").replace(phone, " ").lower().replace(wh_word or "\0", " ")
+    for tok in re.split(r"[\s,./:;()]+", rest):
+        if re.search(r"[a-zа-яөүё가-힣]{2,}", tok) and tok not in _OC_FILLER_EXACT and not tok.startswith(_OC_FILLER_PREFIX): return True
+    return False
+
+def find_my_orders(said, phone, wid):
+    """말 속에 신청자 이름이 들어 있고 전화번호(끝 8자리)도 같은 신청만 찾음 ('윤준식이고' 같은 조사가 붙어도 찾도록 포함 여부로 비교)"""
     key = lambda s: re.sub(r"\s+", "", s or "").lower()
     p8 = lambda s: re.sub(r"\D", "", s or "")[-8:]
     rows = q("SELECT herder, phone, tons, status, ts FROM orders WHERE warehouse_id=? ORDER BY ts DESC LIMIT 500", (wid,))
-    return [r for r in rows if key(r["herder"]) == key(name) and p8(r["phone"]) == p8(phone)]
+    return [r for r in rows if key(r["herder"]) and key(r["herder"]) in key(said) and p8(r["phone"]) == p8(phone)]
 
 def order_check_step(text, flow):
-    """내 신청 확인 대화의 한 단계. 이름 → 전화번호 → 창고를 차례로 묻고, 모두 맞으면 본인 신청 내역만 알려 줌.
-       이름·전화번호는 AI(구글)에게 보내지 않고 여기서만 처리하며, 진행 상태는 화면(브라우저)이 들고 있다가 다시 보내 줌"""
+    """내 신청 확인 대화. 이름·전화번호·창고를 한 번에 받고, 빠진 것만 다시 물은 뒤 모두 맞으면 본인 신청 내역만 알려 줌.
+       이름·전화번호는 AI(구글)에게 보내지 않고 여기서만 처리하며, 지금까지 받은 말은 화면(브라우저)이 들고 있다가 다시 보내 줌"""
     wh_list = ", ".join(w["name"][g.lang] for w in WAREHOUSES)
     reply = lambda key, flow=None, **kw: {"answer": t(key, **kw), "flow": flow, "private": True}
-    if flow is None: return reply("oc_ask_name", {"step": "name"})
-    if any(w in text.lower() for w in _OC_CANCEL_W): return reply("oc_cancel")
-    step, name, phone = flow.get("step"), str(flow.get("name", ""))[:60], str(flow.get("phone", ""))[:30]
-    if step == "name":
-        if not text or len(text) > 40: return reply("oc_ask_name", {"step": "name"})
-        return reply("oc_ask_phone", {"step": "phone", "name": text}, name=text)
-    if step == "phone":
-        if len(re.sub(r"\D", "", text)) < 7: return reply("oc_bad_phone", {"step": "phone", "name": name})
-        return reply("oc_ask_wh", {"step": "wh", "name": name, "phone": text[:30]}, list=wh_list)
-    wid = match_warehouse(text)
-    if not wid: return reply("oc_bad_wh", {"step": "wh", "name": name, "phone": phone}, list=wh_list)
-    mine = find_my_orders(name, phone, wid)
+    if flow is None:
+        if not find_phone(text): return reply("oc_intro", {"step": "info", "text": ""}, list=wh_list)   # 처음 말에 번호가 없으면 안내부터
+        said = text[:300]
+    else:
+        if any(w in text.lower() for w in _OC_CANCEL_W): return reply("oc_cancel")
+        said = ((str(flow.get("text", ""))[:300] + " " + text)[-300:])
+    phone = find_phone(said); wid, wh_word = match_warehouse(said)
+    need = ([t("oc_l_name")] if not has_name_word(said, phone, wh_word) else []) + ([t("oc_l_phone")] if not phone else []) \
+         + ([t("oc_l_wh", list=wh_list)] if not wid else [])
+    if need: return reply("oc_need", {"step": "info", "text": said}, what=", ".join(need))
+    mine = find_my_orders(said, phone, wid)
     if not mine: return reply("oc_none")
     lines = "\n".join(f"• {str(r['ts'])[:10]} · {r['tons']}t · {t('pending') if r['status'] == 'pending' else t('dispatched')}" for r in mine[:5])
     return reply("oc_found", name=mine[0]["herder"], wh=wh_name(wid), lines=lines, truck=TRUCK_CAPACITY_T)
+
 
 @app.route("/chat")
 def chat():
