@@ -1708,7 +1708,7 @@ def api_chat():
     if isinstance(flow, dict) and "?" not in text and "？" not in text: return jsonify(order_check_step(text, flow))   # 확인 대화 중이면 AI로 보내지 않음
     suggestions = suggest_questions(text)
     if suggestions: return jsonify({"answer": t("chat_pick"), "suggestions": suggestions})
-    if wants_order_check(text): return jsonify(order_check_step(text, None))
+    if wants_order_check(text) or len(re.sub(r"\D", "", find_phone(text))) >= 8: return jsonify(order_check_step(text, None))   # 전화번호가 든 말은 AI로 보내지 않고 신청 확인으로 연결
     history = data.get("history", []) if request.is_json else []
     return jsonify({"answer": ask_llm(text, history if isinstance(history, list) else []) or answer_faq(text)})
 
