@@ -42,7 +42,8 @@ ADMIN_PIN        = os.environ.get("HAYLINK_ADMIN_PIN", "")   # 빈 문자열이�
 MODE_SWITCHABLE  = USE_PG and bool(ADMIN_PIN) and not os.environ.get("HAYLINK_PG_SCHEMA")   # 관리자 화면에서 시연/운영 모드를 바꿀 수 있는 조건: Neon 사용 + PIN 설정 (이때 환경변수 HAYLINK_MODE 는 '처음 값'일 뿐)
 MODE_TTL_S       = 5             # 다른 서버(워커)가 모드 변경을 알아채는 데 걸리는 최대 시간(초)
 GEMINI_MODELS    = os.environ.get("HAYLINK_GEMINI_MODEL", "gemini-3.1-flash-lite,gemini-3.5-flash").split(",")   # 앞 모델이 오류·지연이면 다음 모델 시도 (무료 키로 사용 가능)
-GEMINI_TIMEOUT_S = 12            # 모델 하나당 최대 대기 시간(초). 서버가 30초를 넘기면 요청을 끊으므로 짧게 둠
+GEMINI_TOTAL_S   = 25            # 재시도 포함 전체 대기 한도(초). 서버 제한 30초보다 짧게
+GEMINI_TIMEOUT_S = 12           # 모델 하나당 최대 대기 시간(초). 서버가 30초를 넘기면 요청을 끊으므로 짧게 둠
 CHAT_MAX_TURNS   = 10            # AI에게 함께 보내는 이전 대화 최대 개수
 QUESTION_DB_FILE = "questions.db"   # import_questions.py 가 만드는 자주 묻는 질문 DB (데모 초기화에 지워지지 않도록 따로 둠)
 SUGGEST_COUNT    = 6                # 주제 단어만 입력했을 때 보여 줄 질문 버튼 수
@@ -96,6 +97,7 @@ T = {
  "chat_hello":   {"ko": "무엇을 도와드릴까요?", "en": "How can I help you?", "mn": "Танд юугаар туслах вэ?"},
  "chat_ph":      {"ko": "질문을 입력하세요", "en": "Type your question", "mn": "Асуултаа бичнэ үү"},
  "chat_send":    {"ko": "보내기", "en": "Send", "mn": "Илгээх"},
+ "chat_loading": {"ko": "챗봇 답변 생성 중", "en": "Writing an answer", "mn": "Хариулт бэлдэж байна"},
  "chat_pick":    {"ko": "많이 묻는 질문이에요. 궁금한 걸 골라 주세요 👇", "en": "These are frequently asked. Pick one 👇", "mn": "Түгээмэл асуултууд. Сонгоно уу 👇"},
  "chat_fallback":{"ko": "죄송해요, 아직 이 질문은 답을 준비하지 못했어요. 관리자에게 문의해 주세요.", "en": "Sorry, I don't have an answer for that yet. Please contact the administrator.", "mn": "Уучлаарай, энэ асуултад хараахан хариулт бэлдээгүй байна. Удирдлагад хандана уу."},
  "nav_wh":       {"ko": "창고", "en": "Warehouses", "mn": "Агуулах"},
@@ -1151,17 +1153,28 @@ def ask_llm(text, history):
     msgs.append({"role": "user", "parts": [{"text": text[:1000]}]})
     body = json.dumps({"system_instruction": {"parts": [{"text": system}]}, "contents": msgs,
                        "generationConfig": {"maxOutputTokens": 600}}).encode("utf-8")
+    deadline = time.time() + GEMINI_TOTAL_S
     for model in GEMINI_MODELS:
-        req = urllib.request.Request(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{model.strip()}:generateContent",
-            data=body, headers={"Content-Type": "application/json", "x-goog-api-key": key})
-        try:
-            with urllib.request.urlopen(req, timeout=GEMINI_TIMEOUT_S) as res:
-                parts = json.loads(res.read())["candidates"][0]["content"]["parts"]
-            answer = "".join(p.get("text", "") for p in parts).strip()
-            if answer: return answer
-        except Exception as e:
-            print(f"Gemini API error ({model}):", e)
+        for attempt in range(2):   # 모델이 "바빠요"라고 바로 거절하면 잠깐 뒤 한 번 더 시도
+            left = deadline - time.time()
+            if left < 3: return None
+            req = urllib.request.Request(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model.strip()}:generateContent",
+                data=body, headers={"Content-Type": "application/json", "x-goog-api-key": key})
+            try:
+                with urllib.request.urlopen(req, timeout=min(GEMINI_TIMEOUT_S, left)) as res:
+                    parts = json.loads(res.read())["candidates"][0]["content"]["parts"]
+                answer = "".join(p.get("text", "") for p in parts).strip()
+                if answer: return answer
+                break
+            except urllib.error.HTTPError as e:
+                print(f"Gemini API error ({model}, try {attempt + 1}):", e)
+                if e.code in (429, 500, 503) and attempt == 0:
+                    time.sleep(1.5); continue
+                break
+            except Exception as e:   # 시간 초과 등: 같은 모델을 또 기다리지 않고 다음 모델로
+                print(f"Gemini API error ({model}):", e)
+                break
     return None
 
 # ═══════════════════ 화면 (모바일 UI) ═══════════════════
@@ -1386,6 +1399,9 @@ CHAT = """{% extends "base.html" %}{% block content %}
 .chatform{position:fixed;left:50%;transform:translateX(-50%);width:100%;max-width:480px;background:#f4f6f3;border-top:1px solid #e0e4de;padding:8px 14px;z-index:9}
 #chatspace{height:76px} footer{display:none}
 .chips{display:flex;flex-direction:column;gap:6px;align-self:flex-start;max-width:90%}
+.bubble.loading{color:#4a6b4e}
+.bubble.loading::after{content:'...';display:inline-block;vertical-align:bottom;overflow:hidden;width:0;animation:dots 1.2s steps(4,end) infinite}
+@keyframes dots{to{width:1.1em}}
 .chip{width:auto;margin:0;min-height:0;padding:9px 14px;text-align:left;background:#fff;color:#2e5d34;border:1.5px solid #2e5d34;border-radius:16px;font-size:.9rem;font-weight:600}
 </style>
 <div class="card"><div class="chatlog" id="log"><div class="bubble bot">{{ t('chat_hello') }}</div></div></div>
@@ -1408,12 +1424,14 @@ function addChips(list){
 }
 async function send(text){
   add('me', text);
+  add('bot loading', {{ t('chat_loading')|tojson }});
+  const wait = log.lastElementChild;
   try {
     const res = await fetch('/api/chat', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text: text, history: chatHistory})});
-    const data = await res.json(); add('bot', data.answer);
+    const data = await res.json(); wait.remove(); add('bot', data.answer);
     if (data.suggestions) { addChips(data.suggestions); return; }
     chatHistory.push({role:'user', content:text}, {role:'assistant', content:data.answer});
-  } catch(err) { add('bot', '...'); }
+  } catch(err) { wait.remove(); add('bot', '...'); }
 }
 form.addEventListener('submit', function(e){
   e.preventDefault();
