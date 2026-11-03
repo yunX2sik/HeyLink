@@ -295,6 +295,15 @@ T = {
  "sms_nowh":     {"ko": "'{k}' 창고를 찾을 수 없음", "en": "Warehouse '{k}' not found", "mn": "'{k}' агуулах олдсонгүй"},
  "sms_num":      {"ko": "톤수는 숫자여야 함", "en": "Tons must be a number", "mn": "Тонн нь тоо байх ёстой"},
  "sms_herder":   {"ko": "SMS 목민", "en": "SMS herder", "mn": "SMS малчин"},
+ # 내 신청 확인 대화 (이름·전화번호·창고를 차례로 물어봄. 이 대화는 AI에게 보내지 않음)
+ "oc_ask_name":  {"ko": "네, 신청 내역을 확인해 드릴게요 😊\n먼저 신청하실 때 쓰신 이름을 알려 주세요.", "en": "Sure, let me check your request 😊\nFirst, what name did you use when you requested?", "mn": "За, захиалгыг тань шалгаж өгье 😊\nЭхлээд захиалахдаа бичсэн нэрээ хэлнэ үү."},
+ "oc_ask_phone": {"ko": "{name}님, 반가워요! 이번에는 신청 때 적으신 전화번호를 알려 주세요. (예: 9911 2233)", "en": "Nice to meet you, {name}! Now, what phone number did you use? (e.g. 9911 2233)", "mn": "{name}, сайн байна уу! Одоо захиалахдаа бичсэн утасны дугаараа хэлнэ үү. (жишээ нь: 9911 2233)"},
+ "oc_bad_phone": {"ko": "전화번호를 숫자로 다시 알려 주세요 (7자리 이상).", "en": "Please type the phone number again, digits only (at least 7).", "mn": "Утасны дугаараа тоогоор дахин бичнэ үү (дор хаяж 7 орон)."},
+ "oc_ask_wh":    {"ko": "마지막이에요! 어느 창고에 신청하셨나요?\n({list})", "en": "Last one! Which warehouse did you request from?\n({list})", "mn": "Сүүлчийнх! Аль агуулахад захиалсан бэ?\n({list})"},
+ "oc_bad_wh":    {"ko": "창고 이름을 못 찾았어요. 이 중에서 알려 주세요: {list}", "en": "I couldn't find that warehouse. Please pick one: {list}", "mn": "Агуулахын нэрийг олсонгүй. Эдгээрээс сонгоно уу: {list}"},
+ "oc_found":     {"ko": "확인했어요! {name}님의 {wh} 신청 내역이에요 👇\n{lines}\n\n대기 중인 신청은 같은 창고 신청이 트럭 1대({truck}t)가 되면 함께 배송 요청돼요.", "en": "Found it! Here are {name}'s requests at {wh} 👇\n{lines}\n\nPending requests are sent together once the requests from one warehouse reach one truck ({truck} t).", "mn": "Шалгалаа! {name}-ийн {wh} дахь захиалга 👇\n{lines}\n\nХүлээгдэж буй захиалгууд нэг ачааны машин ({truck}т) болмогц хамт хүргэгдэнэ."},
+ "oc_none":      {"ko": "말씀하신 정보로 신청을 찾지 못했어요 😢\n이름, 전화번호, 창고를 다시 한번 확인해 주세요.\n다시 확인하려면 \"내 주문 확인\"이라고 입력해 주세요.", "en": "I couldn't find a request with that information 😢\nPlease double-check the name, phone number and warehouse.\nTo try again, type \"check my order\".", "mn": "Таны хэлсэн мэдээллээр захиалга олдсонгүй 😢\nНэр, утасны дугаар, агуулахаа дахин нягтална уу.\nДахин шалгахын тулд \"миний захиалга шалгах\" гэж бичнэ үү."},
+ "oc_cancel":    {"ko": "알겠어요, 확인을 멈출게요. 궁금한 게 있으면 언제든 물어보세요!", "en": "Okay, I'll stop checking. Ask me anything anytime!", "mn": "За, шалгахаа зогсоолоо. Асуух зүйл байвал хэзээ ч асуугаарай!"},
 }
 
 def t(key, **kw):
@@ -1420,6 +1429,7 @@ CHAT = """{% extends "base.html" %}{% block content %}
 <script>
 const log = document.getElementById('log'), form = document.getElementById('chatform'), q = document.getElementById('q');
 const chatHistory = [];
+let orderFlow = null;   // '내 신청 확인' 대화 진행 상태 (이름·전화번호는 AI 대화 기록에 넣지 않음)
 function layout(){ const tabs = document.querySelector('.tabs'); form.style.bottom = tabs.offsetHeight + 'px'; document.getElementById('chatspace').style.height = (form.offsetHeight + 12) + 'px'; }
 function toBottom(){ window.scrollTo({top: document.documentElement.scrollHeight, behavior: 'smooth'}); }
 window.addEventListener('load', layout); window.addEventListener('resize', layout);
@@ -1435,8 +1445,10 @@ async function send(text){
   add('bot loading', {{ t('chat_loading')|tojson }});
   const wait = log.lastElementChild;
   try {
-    const res = await fetch('/api/chat', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text: text, history: chatHistory})});
+    const res = await fetch('/api/chat', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text: text, history: chatHistory, flow: orderFlow})});
     const data = await res.json(); wait.remove(); add('bot', data.answer);
+    orderFlow = data.flow || null;
+    if (data.private) return;
     if (data.suggestions) { addChips(data.suggestions); return; }
     chatHistory.push({role:'user', content:text}, {role:'assistant', content:data.answer});
   } catch(err) { wait.remove(); add('bot', '...'); }
@@ -1617,6 +1629,53 @@ def api_sms():
         return redirect(msg_url("/order", "msg_sms_ok", kind="err", reply=reply))
     return redirect(msg_url("/order", "msg_sms_err", kind="err", e=t(key, **kw)))
 
+_OC_ORDER_W = ("주문", "신청", "order", "request", "захиал", "хүсэлт")
+_OC_CHECK_W = ("확인", "들어갔", "들어 갔", "들어왔", "접수", "됐", "됬", "되었", "되어", "내역", "조회", "check", "status", "went through",
+               "go through", "receiv", "confirm", "my order", "my request", "шалга", "орсон", "бүртгэ", "миний")
+_OC_SKIP_W  = ("방법", "어떻게", "how to", "how do", "яаж")
+_OC_CANCEL_W = ("취소", "그만", "cancel", "stop", "болих", "зогс")
+
+def wants_order_check(text):
+    """'내 주문 들어갔는지 확인하고 싶어'처럼 본인 신청 확인을 원하는 말인지"""
+    s = (text or "").lower()
+    return any(w in s for w in _OC_ORDER_W) and any(w in s for w in _OC_CHECK_W) and not any(w in s for w in _OC_SKIP_W)
+
+def match_warehouse(text):
+    s = re.sub(r"\s+", "", (text or "").lower())
+    for w in WAREHOUSES:
+        for nm in w["name"].values():
+            first = nm.split()[0].lower()   # '준모드 1호 창고' → '준모드'
+            if first and first in s: return w["id"]
+    return None
+
+def find_my_orders(name, phone, wid):
+    """이름·전화번호(끝 8자리)가 모두 같은 신청만 찾음"""
+    key = lambda s: re.sub(r"\s+", "", s or "").lower()
+    p8 = lambda s: re.sub(r"\D", "", s or "")[-8:]
+    rows = q("SELECT herder, phone, tons, status, ts FROM orders WHERE warehouse_id=? ORDER BY ts DESC LIMIT 500", (wid,))
+    return [r for r in rows if key(r["herder"]) == key(name) and p8(r["phone"]) == p8(phone)]
+
+def order_check_step(text, flow):
+    """내 신청 확인 대화의 한 단계. 이름 → 전화번호 → 창고를 차례로 묻고, 모두 맞으면 본인 신청 내역만 알려 줌.
+       이름·전화번호는 AI(구글)에게 보내지 않고 여기서만 처리하며, 진행 상태는 화면(브라우저)이 들고 있다가 다시 보내 줌"""
+    wh_list = ", ".join(w["name"][g.lang] for w in WAREHOUSES)
+    reply = lambda key, flow=None, **kw: {"answer": t(key, **kw), "flow": flow, "private": True}
+    if flow is None: return reply("oc_ask_name", {"step": "name"})
+    if any(w in text.lower() for w in _OC_CANCEL_W): return reply("oc_cancel")
+    step, name, phone = flow.get("step"), str(flow.get("name", ""))[:60], str(flow.get("phone", ""))[:30]
+    if step == "name":
+        if not text or len(text) > 40: return reply("oc_ask_name", {"step": "name"})
+        return reply("oc_ask_phone", {"step": "phone", "name": text}, name=text)
+    if step == "phone":
+        if len(re.sub(r"\D", "", text)) < 7: return reply("oc_bad_phone", {"step": "phone", "name": name})
+        return reply("oc_ask_wh", {"step": "wh", "name": name, "phone": text[:30]}, list=wh_list)
+    wid = match_warehouse(text)
+    if not wid: return reply("oc_bad_wh", {"step": "wh", "name": name, "phone": phone}, list=wh_list)
+    mine = find_my_orders(name, phone, wid)
+    if not mine: return reply("oc_none")
+    lines = "\n".join(f"• {str(r['ts'])[:10]} · {r['tons']}t · {t('pending') if r['status'] == 'pending' else t('dispatched')}" for r in mine[:5])
+    return reply("oc_found", name=mine[0]["herder"], wh=wh_name(wid), lines=lines, truck=TRUCK_CAPACITY_T)
+
 @app.route("/chat")
 def chat():
     return render_template("chat.html")
@@ -1626,8 +1685,11 @@ def api_chat():
     data = request.get_json(silent=True) or request.form
     text = (data.get("text", "") or "").strip()
     if not text: return jsonify({"answer": t("chat_fallback")})
+    flow = data.get("flow") if request.is_json else None
+    if isinstance(flow, dict) and "?" not in text and "？" not in text: return jsonify(order_check_step(text, flow))   # 확인 대화 중이면 AI로 보내지 않음
     suggestions = suggest_questions(text)
     if suggestions: return jsonify({"answer": t("chat_pick"), "suggestions": suggestions})
+    if wants_order_check(text): return jsonify(order_check_step(text, None))
     history = data.get("history", []) if request.is_json else []
     return jsonify({"answer": ask_llm(text, history if isinstance(history, list) else []) or answer_faq(text)})
 
