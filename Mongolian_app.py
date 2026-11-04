@@ -218,7 +218,7 @@ T = {
  "pin_ph":       {"ko": "PIN", "en": "PIN", "mn": "PIN"},
  "pin_btn":      {"ko": "확인", "en": "Enter", "mn": "Нэвтрэх"},
  "pin_bad":      {"ko": "PIN이 올바르지 않습니다", "en": "Wrong PIN", "mn": "PIN буруу байна"},
- "ai_deplete":   {"ko": "AI 기반 소진 예측 날짜", "en": "AI-predicted run-out date", "mn": "AI-аар таамагласан дуусах огноо"},
+ "ai_deplete":   {"ko": "소진 예측 날짜", "en": "Predicted run-out date", "mn": "Дуусах таамаглал огноо"},
  "logout":       {"ko": "로그아웃 (사용자 화면으로)", "en": "Log out (back to user view)", "mn": "Гарах (хэрэглэгчийн харагдац руу)"},
  "msg_logout":   {"ko": "로그아웃했어요. 지금은 일반 사용자 화면이에요", "en": "Logged out. You are now seeing the user view", "mn": "Гарлаа. Одоо хэрэглэгчийн харагдац байна"},
  # 운영 모드 전환 (관리자)
