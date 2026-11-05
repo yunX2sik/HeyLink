@@ -122,7 +122,7 @@ T = {
  "back":         {"ko": "← 창고 목록", "en": "← All warehouses", "mn": "← Агуулахын жагсаалт"},
  "cur_stock":    {"ko": "현재 건초 잔량", "en": "Current hay stock", "mn": "Одоогийн өвсний нөөц"},
  "last_reading": {"ko": "마지막 측정", "en": "Last reading", "mn": "Сүүлийн хэмжилт"},
- "forecast":     {"ko": "소진 예측 (AI v0)", "en": "Depletion forecast (AI v0)", "mn": "Дуусах таамаглал (AI v0)"},
+ "forecast":     {"ko": "소진 예측 날짜", "en": "Predicted run-out date", "mn": "Дуусах таамаглал огноо"},
  "base_days":    {"ko": "기본 {a}일 → 한파 반영 {b}일", "en": "Base {a} days → with cold {b} days", "mn": "Үндсэн {a} хоног → хүйтэн тооцвол {b} хоног"},
  "temp_min":     {"ko": "예보 최저기온", "en": "Forecast min. temp", "mn": "Хамгийн бага температурын урьдчилсан мэдээ"},
  "reorder":      {"ko": "재보충 권고일", "en": "Recommended restock date", "mn": "Нөөц нөхөх зөвлөмжийн өдөр"},
