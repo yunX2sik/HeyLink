@@ -378,7 +378,9 @@ def _get_pool(schema):
                     boot.execute("CREATE TABLE IF NOT EXISTS public.haylink_settings(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT)")
                     boot.execute("SELECT pg_advisory_unlock(727274)")
                 pool = ConnectionPool(PG_URL, min_size=1, max_size=4, max_idle=120, open=False,
-                                      kwargs={"row_factory": dict_row, "connect_timeout": 30, "options": f"-c search_path={schema}"})
+                                      check=ConnectionPool.check_connection,      # 연결을 내주기 전에 살아 있는지 확인 — Neon 이 잠들며 끊긴 연결을 버리고 새로 연결
+                                      kwargs={"row_factory": dict_row, "connect_timeout": 15, "options": f"-c search_path={schema}",
+                                              "keepalives": 1, "keepalives_idle": 30, "keepalives_interval": 10, "keepalives_count": 3})
                 pool.open(wait=True, timeout=60)
                 atexit.register(pool.close)                   # 서버가 꺼질 때 연결을 깔끔하게 닫음
                 _pools[schema] = pool
@@ -438,9 +440,11 @@ def _active_schema():
     return sch
 
 def _pg_retry(fn):
-    try: return fn()
-    except (psycopg.OperationalError, psycopg.InterfaceError):    # 끊긴 연결(Neon 대기 상태 등)이면 새 연결로 한 번 더
-        return fn()
+    for attempt in range(3):
+        try: return fn()
+        except (psycopg.OperationalError, psycopg.InterfaceError):    # 끊긴 연결(Neon 대기 상태 등)이면 새 연결로 다시 (최대 3번)
+            if attempt == 2: raise
+            time.sleep(1)
 
 class _Tx:
     """한 묶음의 DB 작업: 끝나면 저장, 오류가 나면 모두 되돌림"""
